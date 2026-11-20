@@ -48,11 +48,28 @@ class SessionStore:
 
     def _sessions(self):
         sessions = []
+        base = self.base_dir.resolve()
         for path in self.base_dir.iterdir():
             matched = SESSION_NAME.fullmatch(path.name)
-            if matched and path.is_dir():
+            if matched and path.is_dir() and path.resolve() == base / path.name:
                 sessions.append((int(matched[1]), path))
         return sorted(sessions)
+
+    def list_sessions(self) -> list[Path]:
+        """Return local project folders in descending session number."""
+        return [path for _, path in reversed(self._sessions())]
+
+    def open_session(self, name: str) -> list[Image.Image]:
+        """Switch projects only after successfully reading the selected frames."""
+        folder = next((path for path in self.list_sessions() if path.name == name), None)
+        if folder is None:
+            raise ValueError("找不到所选作品。")
+
+        cache = {}
+        frames = self._read_frames(folder, cache)
+        self.folder = folder
+        self._cache = cache
+        return frames
 
     def new_session(self):
         sessions = self._sessions()
@@ -67,9 +84,9 @@ class SessionStore:
         self.folder = folder
         self._cache.clear()
 
-    def _frame_entries(self):
+    def _frame_entries(self, folder):
         entries = []
-        for path in self.folder.iterdir():
+        for path in folder.iterdir():
             matched = FRAME_NAME.fullmatch(path.name)
             if matched:
                 entries.append((int(matched[1]), path))
@@ -77,19 +94,22 @@ class SessionStore:
 
     @property
     def frames(self) -> list[Image.Image]:
+        return self._read_frames(self.folder, self._cache)
+
+    def _read_frames(self, folder, cache):
         images = []
-        for _, path in self._frame_entries():
-            if path not in self._cache:
+        for _, path in self._frame_entries(folder):
+            if path not in cache:
                 try:
                     with Image.open(path) as source:
-                        self._cache[path] = source.convert("RGB")
+                        cache[path] = source.convert("RGB")
                 except OSError as error:
                     raise OSError(f"无法读取动画帧 {path.name}：{error}") from error
-            images.append(self._cache[path])
+            images.append(cache[path])
         return images
 
     def append(self, image: Image.Image):
-        entries = self._frame_entries()
+        entries = self._frame_entries(self.folder)
         number = entries[-1][0] + 1 if entries else 1
         # A unique suffix prevents simultaneous captures overwriting each other.
         path = self.folder / f"frame-{number:06d}-{uuid4().hex}.png"
@@ -99,7 +119,7 @@ class SessionStore:
         self._cache[path] = frame
 
     def undo(self) -> bool:
-        entries = self._frame_entries()
+        entries = self._frame_entries(self.folder)
         if not entries:
             return False
         path = entries[-1][1]

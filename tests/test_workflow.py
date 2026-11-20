@@ -104,5 +104,76 @@ class StudioWorkflowTest(unittest.TestCase):
             root.update_idletasks()
 
 
+    def test_open_existing_project_and_continue_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+
+            first_folder = studio.real_store.folder
+            studio.real_store.append(Image.new("RGB", (80, 80)))
+            studio.new_project()
+            second_folder = studio.real_store.folder
+            studio.real_store.append(Image.new("RGB", (80, 80), "blue"))
+
+            studio.start_demo()
+            start = studio.demo.started
+
+            def choose(names, current):
+                self.assertEqual(names, [second_folder.name, first_folder.name])
+                self.assertEqual(current, second_folder.name)
+                for elapsed in (0, 0.3, 0.6, 0.9):
+                    studio._step(start + elapsed)
+                self.assertEqual(studio.store.frames, [])
+                return first_folder.name
+
+            with patch.object(studio.ui, "choose_project", side_effect=choose):
+                studio.ui.open_project_button.invoke()
+            self.assertIs(studio.store, studio.real_store)
+            self.assertEqual(studio.real_store.folder, first_folder)
+            self.assertIsNone(studio.demo)
+            self.assertFalse(studio.real_store.frames[-1].getbbox())
+            self.assertIn("0001", studio.ui.project_label.cget("text"))
+
+            # Feed a real controller its next hand cycle without using a physical camera.
+            with patch("app.CameraFeed"):
+                studio.start_camera(0)
+                frame = np.zeros((80, 80, 3), dtype=np.uint8)
+                frame[10:30, 20:40] = (40, 170, 240)
+                studio._observe(frame, True, start + 2.0)
+                for elapsed in (2.1, 2.3, 2.5, 2.8):
+                    studio._observe(frame, False, start + elapsed)
+                self.assertEqual(len(studio.store.frames), 2)
+
+            output = Path(directory) / "reopened.gif"
+            with patch("app.filedialog.asksaveasfilename", return_value=str(output)):
+                studio.export_gif()
+            with Image.open(output) as gif:
+                self.assertEqual(gif.n_frames, 2)
+            with patch.object(studio.ui, "choose_project", return_value=second_folder.name):
+                studio.open_project_dialog()
+            self.assertEqual(studio.real_store.folder, second_folder)
+            self.assertEqual(studio.store.frames[0].getpixel((0, 0)), (0, 0, 255))
+            self.assertEqual(len(studio.store.frames), 1)
+
+    def test_demo_stops_after_eight_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            studio.start_demo()
+            start = studio.demo.started
+            for step in range(250):
+                studio._step(start + step * 0.1)
+            self.assertIsNone(studio.demo)
+            self.assertEqual(len(studio.store.frames), 8)
+            self.assertEqual(studio.real_store.frames, [])
+            self.assertIn("演示已拍好", studio.ui.status_label.cget("text"))
+
+
 if __name__ == "__main__":
     unittest.main()

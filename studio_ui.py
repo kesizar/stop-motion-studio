@@ -57,6 +57,8 @@ class StudioUI:
         label(header, "逐格  /  定格动画工作台", 15, True, "white", DARK).pack(side="left")
         self.source_label = label(header, self._source, fg="#bbded7", bg=DARK)
         self.source_label.pack(side="right")
+        self.project_label = label(header, "", fg="white", bg=DARK)
+        self.project_label.pack(side="right", padx=(0, 14))
 
         body = tk.Frame(root, bg="#f0f4f5")
         body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(10, 8))
@@ -129,7 +131,12 @@ class StudioUI:
         self.undo_button.grid(row=0, column=1, sticky="ew", padx=(2, 0))
         self.export_button = button(panel, "导出 GIF", controller.export_gif, True)
         self.export_button.grid(row=9, column=0, sticky="ew", pady=(5, 0))
-        button(panel, "新建项目", controller.new_project).grid(row=10, column=0, sticky="ew", pady=(3, 0))
+        projects = self._paired_row(panel, 10)
+        self.open_project_button = button(projects, "打开作品…", controller.open_project_dialog)
+        self.open_project_button.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(3, 0))
+        button(projects, "新建项目", controller.new_project).grid(
+            row=0, column=1, sticky="ew", padx=(2, 0), pady=(3, 0),
+        )
 
         timeline = tk.Frame(root, bg=PAPER, padx=10, pady=4)
         timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
@@ -178,6 +185,64 @@ class StudioUI:
             self.set_status("摄像头编号需要是非负整数，一般先试 0。")
             return
         self.controller.start_camera(index)
+
+    @staticmethod
+    def _project_title(name: str) -> str:
+        return f"作品 {name.removeprefix('session-')}"
+
+    def set_project(self, name: str) -> None:
+        self.project_label.config(text=self._project_title(name) if name else "")
+
+    def choose_project(self, names: list[str], current: str) -> str | None:
+        """Return a chosen session name. Closing the dialog leaves the project unchanged."""
+        if not names:
+            return None
+
+        window = tk.Toplevel(self.root)
+        window.title("打开作品")
+        window.transient(self.root)
+        window.configure(bg=PAPER, padx=14, pady=12)
+        window.resizable(False, False)
+        label(window, "选择要继续编辑的作品", 11, True).pack(anchor="w", pady=(0, 8))
+
+        project_list = tk.Frame(window, bg=PAPER)
+        project_list.pack(fill="x")
+        scrollbar = ttk.Scrollbar(project_list, orient="vertical")
+        scrollbar.pack(side="right", fill="y")
+        options = tk.Listbox(
+            project_list, width=30, height=min(8, len(names)), selectmode=tk.BROWSE,
+            exportselection=False, font=(FONT, 10), yscrollcommand=scrollbar.set,
+        )
+        options.pack(side="left", fill="both")
+        scrollbar.config(command=options.yview)
+        for name in names:
+            suffix = "（当前）" if name == current else ""
+            options.insert(tk.END, self._project_title(name) + suffix)
+        selected = names.index(current) if current in names else 0
+        options.selection_set(selected)
+        options.activate(selected)
+        options.see(selected)
+
+        result = None
+
+        def accept(_event=None):
+            nonlocal result
+            selection = options.curselection()
+            if selection:
+                result = names[selection[0]]
+                window.destroy()
+
+        actions = tk.Frame(window, bg=PAPER)
+        actions.pack(fill="x", pady=(10, 0))
+        button(actions, "打开", accept, True).pack(side="right")
+        button(actions, "取消", window.destroy).pack(side="right", padx=(0, 6))
+        window.bind("<Return>", accept)
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.wait_visibility()
+        window.grab_set()
+        options.focus_set()
+        window.wait_window()
+        return result
 
     def set_source(self, label):
         self._source = label

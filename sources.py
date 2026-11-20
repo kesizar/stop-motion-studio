@@ -41,6 +41,7 @@ class CameraFeed:
         self.index = index
         self.latest = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
+        self.hand_sequence = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _publish(self, item):
@@ -84,7 +85,6 @@ class CameraFeed:
                 capture.release()
 
     def start(self):
-        self.hand_sequence = 0
         self.thread.start()
 
     def close(self):

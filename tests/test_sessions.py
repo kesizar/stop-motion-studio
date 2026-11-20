@@ -38,6 +38,42 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(resumed.folder, self.store.folder)
         self.assertEqual(resumed.frames, [])
 
+    def test_list_open_and_continue_an_older_project(self):
+        self.store.append(Image.new("RGB", (4, 4), "red"))
+        old_folder = self.store.folder
+        self.store.new_session()
+        self.store.append(Image.new("RGB", (4, 4), "blue"))
+        new_folder = self.store.folder
+        (self.store.base_dir / "notes").mkdir()
+        (self.store.base_dir / "session-0003").touch()
+
+        self.assertEqual(self.store.list_sessions(), [new_folder, old_folder])
+        reopened = self.store.open_session(old_folder.name)
+        self.assertEqual([frame.getpixel((0, 0)) for frame in reopened], [(255, 0, 0)])
+        self.store.append(Image.new("RGB", (4, 4), "green"))
+        self.assertEqual(
+            [frame.getpixel((0, 0)) for frame in self.store.frames],
+            [(255, 0, 0), (0, 128, 0)],
+        )
+        self.assertEqual(len(list(new_folder.glob("*.png"))), 1)
+        self.assertEqual(SessionStore(self.store.base_dir).folder, new_folder)
+
+    def test_failed_open_keeps_current_project(self):
+        old_folder = self.store.folder
+        corrupt = old_folder / f"frame-000001-{'0' * 32}.png"
+        corrupt.write_bytes(b"not a PNG")
+        self.store.new_session()
+        self.store.append(Image.new("RGB", (4, 4), "blue"))
+        current_folder = self.store.folder
+
+        for name in ("../" + old_folder.name, old_folder.as_posix(), "session-9999", old_folder.name.upper()):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.store.open_session(name)
+        with self.assertRaises(OSError):
+            self.store.open_session(old_folder.name)
+        self.assertEqual(self.store.folder, current_folder)
+        self.assertEqual([frame.getpixel((0, 0)) for frame in self.store.frames], [(0, 0, 255)])
+
     def test_gif_order_loop_timing_and_mixed_sizes(self):
         for size, color in [((8, 8), "red"), ((8, 4), "green"), ((8, 8), "blue")]:
             self.store.append(Image.new("RGB", size, color))

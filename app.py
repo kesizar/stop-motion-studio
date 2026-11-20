@@ -18,6 +18,9 @@ from sources import CameraFeed, DemoFeed
 from studio_ui import StudioUI
 
 
+DEMO_FRAME_LIMIT = 8
+
+
 def create_window():
     """Make Tcl/Tk scripts accessible when a WindowsApps Python backs the venv."""
     base = Path(sys.base_prefix)
@@ -57,6 +60,7 @@ class Studio:
         self.latest_frame = None
         self.reference_frame = None
         self.capture_notice = None
+        self._dialog_open = False
         self.onion_skin = False
         self.auto_paused = False
         self.wait_for_hand = False
@@ -73,8 +77,10 @@ class Studio:
         self.tick_id = root.after(40, self._tick)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _refresh(self):
-        frames = self.store.frames
+    def _refresh(self, frames=None):
+        if frames is None:
+            frames = self.store.frames
+        self.ui.set_project("" if self.demo_dir is not None else self.store.folder.name)
         self.reference_frame = frames[-1] if frames else None
         self.ui.set_timeline(frames)
         self._show_preview()
@@ -146,6 +152,11 @@ class Studio:
         count = self._refresh()
         self.wait_for_hand = False
         self.capture_notice = (now + 0.8, f"已{mode}拍下第 {count} 帧。")
+        if self.demo is not None and count >= DEMO_FRAME_LIMIT:
+            self.stop_source()
+            self.ui.set_capture_progress(1, captured=True)
+            self.ui.set_status(f"演示已拍好 {count} 帧。点「回放」看纸船移动，或导出 GIF。")
+            return
         self._show_capture_status(now, None, "")
 
     def _show_capture_status(self, now, progress, status):
@@ -209,7 +220,43 @@ class Studio:
         self.demo = DemoFeed()
         self._sync_capture_controls(time.monotonic())
         self.ui.set_source("模拟演示")
-        self.ui.set_status("模拟纸船摆拍。手部信号来自脚本，可回放并导出。")
+        self.ui.set_status(f"模拟纸船摆拍。拍满 {DEMO_FRAME_LIMIT} 帧后可以直接回放。")
+
+    def _run_dialog(self, callback, *args, **kwargs):
+        # Tk keeps processing scheduled events while a modal dialog is open.
+        self._dialog_open = True
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            self._dialog_open = False
+            if self._has_live_preview():
+                self.latest_frame = None
+                self.last_observation = None
+                self.capture_notice = None
+                if self.camera is not None:
+                    self.seen_hand = self.camera.hand_sequence
+                self._reset_gate()
+                self.ui.set_capture_progress(None)
+                self._sync_capture_controls(time.monotonic())
+
+    def open_project_dialog(self):
+        current = self.real_store.folder.name
+        try:
+            names = [folder.name for folder in self.real_store.list_sessions()]
+            selected = self._run_dialog(self.ui.choose_project, names, current)
+            if selected is None or (selected == current and self.demo_dir is None):
+                return
+            frames = self.real_store.open_session(selected)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法打开作品", str(exc), parent=self.root)
+            return
+
+        self.stop_source()
+        self._use_real_store()
+        self._refresh(frames)
+        self._reset_gate()
+        self.ui.set_source("本地作品")
+        self.ui.set_status(f"已打开作品，共 {len(frames)} 帧。打开摄像头继续拍摄。")
 
     def new_project(self):
         self.stop_source()
@@ -258,9 +305,11 @@ class Studio:
     def export_gif(self):
         if not self.store.frames:
             return
-        filename = filedialog.asksaveasfilename(parent=self.root, title="保存定格动画",
-                    defaultextension=".gif", filetypes=[("GIF 动画", "*.gif")],
-                    initialfile="我的定格动画.gif", initialdir=self.real_store.folder.parent)
+        filename = self._run_dialog(
+            filedialog.asksaveasfilename, parent=self.root, title="保存定格动画",
+            defaultextension=".gif", filetypes=[("GIF 动画", "*.gif")],
+            initialfile="我的定格动画.gif", initialdir=self.real_store.folder.parent,
+        )
         if filename:
             try:
                 self.store.export_gif(Path(filename), self.fps)
@@ -295,6 +344,8 @@ class Studio:
 
     def _step(self, now):
         self.retiring = [worker for worker in self.retiring if worker.thread.is_alive()]
+        if self._dialog_open:
+            return
         if self.playing:
             if now >= self.next_frame:
                 frames = self.store.frames
