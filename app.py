@@ -1,4 +1,5 @@
 """定格动画工作台的本机入口。"""
+from bisect import bisect_left
 import os
 import queue
 import shutil
@@ -12,13 +13,16 @@ from tkinter import filedialog, messagebox
 import numpy as np
 from PIL import Image
 
-from sessions import SessionStore
+from capture_region import CaptureRegion, measure_alignment
+from sessions import SessionStore, playback_order
 from shutter import ShutterGate
 from sources import CameraFeed, DemoFeed
 from studio_ui import StudioUI
 
 
 DEMO_FRAME_LIMIT = 8
+ALIGNMENT_INTERVAL = 0.4
+ALIGNMENT_THRESHOLD = 4
 
 
 def create_window():
@@ -56,6 +60,11 @@ class Studio:
         self.retiring = []
         self.demo = None
         self.seen_hand = 0
+        self.capture_region = None
+        self.region_revision = 0
+        self._region_selecting = False
+        self._next_alignment = 0.0
+        self._camera_moved = False
         self.last_observation = None
         self.latest_frame = None
         self.reference_frame = None
@@ -68,6 +77,8 @@ class Studio:
         self.playing = False
         self.inspection_index = None
         self.project_frames = []
+        self.timeline = []
+        self.play_order = ()
         self.play_index = 0
         self.play_position = 0
         self.next_frame = 0.0
@@ -80,13 +91,15 @@ class Studio:
         self.tick_id = root.after(40, self._tick)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _refresh(self, frames=None):
-        if frames is None:
-            frames = self.store.frames
+    def _refresh(self):
+        self.timeline = self.store.timeline
+        self.play_order = playback_order(self.timeline)
+        frames = [item.image for item in self.timeline]
         self.ui.set_project("" if self.demo_dir is not None else self.store.folder.name)
         self.project_frames = frames
         self.reference_frame = frames[-1] if frames else None
         self.ui.set_timeline(frames)
+        self.ui.set_timeline_edits([(item.hold, item.hidden) for item in self.timeline])
         if self.inspection_index is not None and frames:
             self.inspection_index = min(self.inspection_index, len(frames) - 1)
             self._show_frame_index(self.inspection_index)
@@ -95,6 +108,7 @@ class Studio:
             self.ui.set_reviewing(False)
             self.ui.set_frame_position(None)
             self._show_preview()
+        self._sync_edit_controls()
         return len(frames)
 
     def _show_preview(self):
@@ -109,7 +123,55 @@ class Studio:
 
     def _reset_gate(self):
         ref = self.reference_frame
-        self.gate.reset(np.asarray(ref)[:, :, ::-1] if ref is not None else None)
+        frame = np.asarray(ref)[:, :, ::-1] if ref is not None else None
+        self.gate.reset(self._capture_area(frame) if frame is not None else None)
+
+    def _capture_area(self, frame):
+        return self.capture_region.crop(frame) if self.capture_region else frame
+
+    def set_region_selecting(self, active):
+        self._region_selecting = bool(active) and self._has_live_preview()
+        self._reset_gate()
+        self.ui.set_capture_progress(None)
+        self._sync_capture_controls(time.monotonic())
+
+    def set_capture_region(self, rectangle):
+        if not self._has_live_preview():
+            return
+        try:
+            region = CaptureRegion(*rectangle) if rectangle is not None else None
+        except ValueError:
+            self.ui.set_status("拍摄区域太小。请在画面里拖出更大的矩形。")
+            return
+        if region == self.capture_region:
+            return
+        self.capture_region = region
+        self._reset_live_observation()
+        if self.camera is not None:
+            self.region_revision, self.seen_hand = self.camera.set_region(region)
+        self._sync_capture_controls(time.monotonic())
+        text = "拍摄区域已更新。摆放道具时请把手伸进框内。" if region else "已恢复全画面检测。"
+        self.ui.set_status(text)
+
+    def _update_alignment(self, frame, hand_present, now):
+        if self.camera is None or self.reference_frame is None:
+            return
+        if hand_present:
+            self._next_alignment = 0.0
+            return
+        if now < self._next_alignment:
+            return
+        self._next_alignment = now + ALIGNMENT_INTERVAL
+        reference = np.asarray(self.reference_frame)[:, :, ::-1]
+        measurement = measure_alignment(reference, frame)
+        self._camera_moved = measurement is not None and measurement.distance >= ALIGNMENT_THRESHOLD
+        if measurement is None:
+            text = "机位参考不足"
+        elif self._camera_moved:
+            text = f"机位偏移约 {measurement.distance:.0f} 像素"
+        else:
+            text = "机位与上帧对齐"
+        self.ui.set_alignment_status(text)
 
     def _has_live_preview(self):
         return (
@@ -122,6 +184,7 @@ class Studio:
         return (
             self._has_live_preview()
             and self.auto_paused
+            and not self._region_selecting
             and self.latest_frame is not None
             and not self.latest_frame[1]
             and 0 <= now - self.last_observation <= self.gate.max_gap_seconds
@@ -132,6 +195,12 @@ class Studio:
             available=self._has_live_preview(),
             paused=self.auto_paused,
             can_capture=self._can_capture(now),
+        )
+        region = self.capture_region if self._has_live_preview() else None
+        bounds = (region.left, region.top, region.right, region.bottom) if region is not None else None
+        self.ui.set_region_controls(
+            available=self._has_live_preview() and self.latest_frame is not None,
+            region=bounds,
         )
 
     def set_onion_skin(self, enabled):
@@ -165,6 +234,9 @@ class Studio:
     def _save_frame(self, image, now, mode):
         self.store.append(image)
         count = self._refresh()
+        self._reset_alignment()
+        if self.camera is not None:
+            self.ui.set_alignment_status("已更新机位参考")
         self.wait_for_hand = False
         self.capture_notice = (now + 0.8, f"已{mode}拍下第 {count} 帧。")
         if self.demo is not None and count >= DEMO_FRAME_LIMIT:
@@ -195,6 +267,10 @@ class Studio:
             self.retiring.append(self.camera)
             self.camera = None
         self.demo = None
+        self.capture_region = None
+        self.region_revision = 0
+        self._region_selecting = False
+        self._reset_alignment()
         self.latest_frame = None
         self.last_observation = None
         self.capture_notice = None
@@ -207,6 +283,7 @@ class Studio:
         self._show_preview()
         self.ui.set_capture_progress(None)
         self._sync_capture_controls(time.monotonic())
+        self._sync_edit_controls()
         self.ui.set_source("模拟作品" if self.demo_dir else "本地作品")
         self.ui.set_status("已停止拍摄。可以回放、撤回或导出当前作品。")
 
@@ -253,7 +330,13 @@ class Studio:
                 self._reset_live_observation()
                 self._sync_capture_controls(time.monotonic())
 
+    def _reset_alignment(self):
+        self._next_alignment = 0.0
+        self._camera_moved = False
+        self.ui.set_alignment_status("")
+
     def _reset_live_observation(self):
+        self._reset_alignment()
         self.latest_frame = None
         self.last_observation = None
         self.capture_notice = None
@@ -269,17 +352,17 @@ class Studio:
             selected = self._run_dialog(self.ui.choose_project, names, current)
             if selected is None or (selected == current and self.demo_dir is None):
                 return
-            frames = self.real_store.open_session(selected)
+            self.real_store.open_session(selected)
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法打开作品", str(exc), parent=self.root)
             return
 
         self.stop_source()
         self._use_real_store()
-        self._refresh(frames)
+        count = self._refresh()
         self._reset_gate()
         self.ui.set_source("本地作品")
-        self.ui.set_status(f"已打开作品，共 {len(frames)} 帧。打开摄像头继续拍摄。")
+        self.ui.set_status(f"已打开作品，共 {count} 张原图。打开摄像头继续拍摄。")
 
     def new_project(self):
         self.stop_source()
@@ -290,18 +373,86 @@ class Studio:
         self.ui.set_source("本地作品")
         self.ui.set_status("新作品已就绪。上一部作品的原图保存在「作品」目录。")
 
+    def import_images(self):
+        filenames = self._run_dialog(
+            filedialog.askopenfilenames, parent=self.root, title="导入照片序列到本地作品",
+            filetypes=[("照片", ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.tif", "*.tiff"))],
+        )
+        if not filenames:
+            return
+        self.ui.set_status("正在读取并导入照片……")
+        self.root.update_idletasks()
+        try:
+            count = self.real_store.import_images([Path(name) for name in filenames])
+        except (OSError, ValueError) as exc:
+            self.ui.set_status("导入失败。")
+            messagebox.showerror("无法导入照片", str(exc), parent=self.root)
+            return
+        self.stop_source()
+        self._use_real_store()
+        self._refresh()
+        self._reset_gate()
+        self.ui.set_source("本地作品")
+        self.ui.set_status(f"已按文件名顺序导入 {count} 张照片。可检查、编辑或继续拍摄。")
+
     def undo(self):
-        if not self.store.frames:
+        if not self.project_frames:
             return
         self._stop_playback()
         self.store.undo()
         self._refresh()
         self._reset_gate()
+        self._reset_alignment()
         self.wait_for_hand = True
         self.capture_notice = None
         self.ui.set_capture_progress(None)
         self._sync_capture_controls(time.monotonic())
         self.ui.set_status("已撤回一帧。再次伸手摆放道具后继续拍摄。")
+
+    def _sync_edit_controls(self):
+        item = self.timeline[self.inspection_index] if self.inspection_index is not None else None
+        self.ui.set_edit_controls(
+            available=item is not None,
+            hold=item.hold if item else 1,
+            hidden=item.hidden if item else False,
+            can_undo=self.store.can_undo_edit,
+            can_redo=self.store.can_redo_edit,
+        )
+
+    def _apply_edit(self, action, status, *args, **kwargs):
+        try:
+            if not action(*args, **kwargs):
+                return
+        except (OSError, ValueError) as exc:
+            self._sync_edit_controls()
+            messagebox.showerror("无法保存剪辑", str(exc), parent=self.root)
+            return
+        if self.playing:
+            self._stop_playback()
+            self.inspection_index = self.play_position
+            self.ui.set_reviewing(True)
+        self._refresh()
+        self.ui.set_status(status)
+
+    def set_selected_hold(self, value):
+        if self.inspection_index is not None:
+            self._apply_edit(
+                self.store.edit_frame, f"已将这张照片设为停留 {value} 格。",
+                self.inspection_index, hold=value,
+            )
+
+    def toggle_selected_hidden(self):
+        if self.inspection_index is not None:
+            index = self.inspection_index
+            hidden = not self.timeline[index].hidden
+            status = "已从成片隐藏，原图仍在时间轴。" if hidden else "已恢复显示这张照片。"
+            self._apply_edit(self.store.edit_frame, status, index, hidden=hidden)
+
+    def undo_edit(self):
+        self._apply_edit(self.store.undo_edit, "已撤销上一步剪辑。")
+
+    def redo_edit(self):
+        self._apply_edit(self.store.redo_edit, "已重做上一步剪辑。")
 
     def set_fps(self, fps):
         self.fps = min(16, max(2, int(fps)))
@@ -320,7 +471,8 @@ class Studio:
         self.ui.set_capture_progress(None)
         self._sync_capture_controls(time.monotonic())
         self._show_frame_index(index)
-        self.ui.set_status(f"正在检查第 {index + 1} 帧。点「返回取景」继续拍摄。")
+        self._sync_edit_controls()
+        self.ui.set_status(f"正在检查第 {index + 1} 帧。可以设置停留时长或从成片隐藏。")
 
     def step_frame(self, delta):
         if not self.project_frames:
@@ -341,6 +493,7 @@ class Studio:
         self.ui.set_frame_position(None)
         self._reset_live_observation()
         self._sync_capture_controls(time.monotonic())
+        self._sync_edit_controls()
         self._show_preview()
         if self._has_live_preview():
             self.ui.set_status("已返回取景。")
@@ -350,10 +503,10 @@ class Studio:
     def playback(self):
         if self.playing:
             self.resume_preview()
-        elif self.project_frames:
-            start = self.inspection_index if self.inspection_index is not None else 0
+        elif self.play_order:
+            start = bisect_left(self.play_order, self.inspection_index or 0) % len(self.play_order)
             self.play_index = start
-            self.play_position = start
+            self.play_position = self.play_order[start]
             self.next_frame = 0.0
             self.inspection_index = None
             self.playing = True
@@ -361,8 +514,9 @@ class Studio:
             self.ui.set_playing(True)
             self.ui.set_capture_progress(None)
             self._sync_capture_controls(time.monotonic())
-            self._show_frame_index(start)
-            self.ui.set_status("正在循环回放。点击时间轴可以停在指定帧。")
+            self._show_frame_index(self.play_position)
+            self._sync_edit_controls()
+            self.ui.set_status(f"正在回放成片，共 {len(self.play_order)} 格。点击时间轴可以停在指定帧。")
 
     def export_gif(self):
         self._export_animation("gif", "GIF 动画", self.store.export_gif)
@@ -371,7 +525,7 @@ class Studio:
         self._export_animation("mp4", "MP4 视频", self.store.export_mp4)
 
     def _export_animation(self, extension, label, exporter):
-        if not self.project_frames:
+        if not self.play_order:
             return
         filename = self._run_dialog(
             filedialog.asksaveasfilename, parent=self.root, title=f"导出{label}",
@@ -399,6 +553,10 @@ class Studio:
         self.latest_frame = (image, hand_present)
         self._show_preview()
         self._sync_capture_controls(now)
+        if self._region_selecting:
+            self.ui.set_status("拖动鼠标画出检测区，松开确认，Esc 取消。")
+            return
+        self._update_alignment(frame, hand_present, now)
         if self.auto_paused:
             status = "自动快门已暂停。"
             if hand_present:
@@ -407,8 +565,12 @@ class Studio:
             return
         if self.wait_for_hand and not hand_present:
             return
+        if self._camera_moved and not hand_present:
+            self._reset_gate()
+            self._show_capture_status(now, None, "检测到机位偏移，请放回原位后重新摆放道具。")
+            return
         self.wait_for_hand = False
-        capture, status = self.gate.update(frame, hand_present, now)
+        capture, status = self.gate.update(self._capture_area(frame), hand_present, now)
         if capture:
             self._save_frame(image, now, "自动")
         else:
@@ -424,7 +586,7 @@ class Studio:
                     self.next_frame = now
                 skipped = int((now - self.next_frame) * self.fps)
                 self.play_index += skipped
-                self.play_position = self.play_index % len(self.project_frames)
+                self.play_position = self.play_order[self.play_index % len(self.play_order)]
                 self._show_frame_index(self.play_position)
                 self.play_index += 1
                 self.next_frame += (skipped + 1) / self.fps
@@ -432,7 +594,7 @@ class Studio:
         if self.inspection_index is not None:
             return
         if self.demo:
-            frame, hand = self.demo.read(now)
+            frame, hand = self.demo.read(now, self.capture_region)
             self._observe(frame, hand, now)
         elif self.camera:
             if self.camera.thread.ident is None and not self.retiring:
@@ -453,7 +615,9 @@ class Studio:
                 self.ui.set_status(item)
                 messagebox.showerror("摄像头未就绪", item, parent=self.root)
                 return
-            frame, hand, stamp, sequence = item
+            frame, hand, stamp, sequence, revision = item
+            if revision != self.region_revision:
+                return
             observed_hand = hand or sequence != self.seen_hand
             self.seen_hand = sequence
             self._observe(frame, observed_hand, stamp)

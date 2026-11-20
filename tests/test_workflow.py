@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from app import Studio, create_window
+from sessions import SessionStore
 
 
 class StudioWorkflowTest(unittest.TestCase):
@@ -268,6 +269,132 @@ class StudioWorkflowTest(unittest.TestCase):
                 studio.ui.export_mp4_button.invoke()
             self.assertEqual(dialog.call_args.kwargs["defaultextension"], ".mp4")
             export.assert_called_once_with(output, 6)
+
+
+    def test_photo_import_edit_history_playback_and_gif_share_schedule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, path / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            input_files = [path / name for name in ("照片10.png", "照片2.png", "照片1.png")]
+            for file, color in zip(input_files, ("blue", "green", "red")):
+                Image.new("RGB", (60, 50), color).save(file)
+            with patch("app.filedialog.askopenfilenames", return_value=tuple(map(str, input_files))):
+                studio.ui.import_button.invoke()
+            raw = [item.image.getpixel((0, 0)) for item in studio.timeline]
+            self.assertEqual(raw, [(255, 0, 0), (0, 128, 0), (0, 0, 255)])
+
+            studio.seek_frame(2)
+            studio.ui.hold_spinbox.delete(0, "end")
+            studio.ui.hold_spinbox.insert(0, "3")
+            studio.ui.apply_hold_button.invoke()
+            studio.seek_frame(1)
+            studio.ui.hide_frame_button.invoke()
+            self.assertEqual(studio.play_order, (0, 2, 2, 2))
+            studio.ui.edit_undo_button.invoke()
+            self.assertEqual(studio.play_order, (0, 1, 2, 2, 2))
+            studio.ui.edit_redo_button.invoke()
+            self.assertEqual(studio.play_order, (0, 2, 2, 2))
+            self.assertEqual([frame.getpixel((0, 0)) for frame in studio.store.frames], raw)
+            reopened = SessionStore(studio.real_store.base_dir)
+            self.assertEqual([(item.hold, item.hidden) for item in reopened.timeline],
+                             [(1, False), (1, True), (3, False)])
+
+            studio.playback()
+            self.assertEqual(studio.play_position, 2)
+            for when in (1.0, 1.125, 1.25):
+                studio._step(when)
+                self.assertEqual(studio.play_position, 2)
+            studio._step(1.375)
+            self.assertEqual(studio.play_position, 0)
+
+            output = path / "剪辑.gif"
+            with patch("app.filedialog.asksaveasfilename", return_value=str(output)):
+                studio.ui.export_button.invoke()
+            with Image.open(output) as gif:
+                self.assertEqual(gif.n_frames, 2)
+                delays = []
+                for index, value in enumerate((raw[0], raw[2])):
+                    gif.seek(index)
+                    self.assertEqual(gif.convert("RGB").getpixel((0, 0)), value)
+                    delays.append(gif.info["duration"])
+                self.assertEqual(sum(delays), 500)
+
+    def test_capture_region_ignores_changes_outside_and_keeps_full_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            studio.start_demo()
+            start = studio.demo.started
+            base = np.zeros((80, 80, 3), dtype=np.uint8)
+            studio._observe(base, False, start)
+            studio.set_region_selecting(True)
+            for elapsed in (0.2, 0.4, 0.7):
+                studio._observe(base, False, start + elapsed)
+            self.assertEqual(studio.store.frames, [])
+            studio.set_capture_region((0.25, 0.25, 0.75, 0.75))
+            studio.set_region_selecting(False)
+            for elapsed in (0.8, 1.0, 1.2, 1.5):
+                studio._observe(base, False, start + elapsed)
+            self.assertEqual(len(studio.store.frames), 1)
+
+            outer = base.copy()
+            outer[:15, :15] = (55, 20, 120)
+            studio._observe(outer, True, start + 1.6)
+            for elapsed in (1.7, 1.9, 2.1, 2.4):
+                studio._observe(outer, False, start + elapsed)
+            self.assertEqual(len(studio.store.frames), 1)
+
+            inner = outer.copy()
+            inner[30:46, 30:46] = (70, 120, 200)
+            studio._observe(inner, True, start + 2.5)
+            for elapsed in (2.6, 2.8, 3.0, 3.3):
+                studio._observe(inner, False, start + elapsed)
+            self.assertEqual(len(studio.store.frames), 2)
+            final = studio.store.frames[-1]
+            self.assertEqual(final.size, (80, 80))
+            self.assertEqual(final.getpixel((4, 4)), (120, 20, 55))
+            self.assertEqual(final.getpixel((36, 36)), (200, 120, 70))
+
+
+    def test_camera_offset_warns_and_waits_for_a_new_placement(self):
+        import cv2
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            rng = np.random.default_rng(102)
+            texture = rng.integers(25, 155, (120, 160), dtype=np.uint8)
+            reference = np.repeat(texture[:, :, None], 3, axis=2)
+            studio.store.append(Image.fromarray(reference))
+            studio._refresh()
+            shifted = cv2.warpAffine(reference, np.float32([[1, 0, 7], [0, 1, -5]]), (160, 120))
+            changed = reference.copy()
+            changed[48:68, 66:88] = (25, 165, 250)
+
+            with patch("app.CameraFeed"):
+                studio.start_camera(0)
+                studio._observe(shifted, True, 1.0)
+                for stamp in (1.1, 1.3, 1.6, 1.9):
+                    studio._observe(shifted, False, stamp)
+                self.assertIn("机位偏移", studio.ui.alignment_label.cget("text"))
+                self.assertEqual(len(studio.store.frames), 1)
+
+                studio._observe(reference, False, 2.4)
+                self.assertIn("对齐", studio.ui.alignment_label.cget("text"))
+                studio._observe(changed, True, 2.5)
+                for stamp in (2.6, 2.8, 3.0, 3.3):
+                    studio._observe(changed, False, stamp)
+                self.assertEqual(len(studio.store.frames), 2)
 
 
 if __name__ == "__main__":

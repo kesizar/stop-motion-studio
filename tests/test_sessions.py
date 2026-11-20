@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from sessions import SessionStore
+from sessions import SessionStore, playback_order
 
 
 class SessionStoreTests(unittest.TestCase):
@@ -195,3 +195,128 @@ class SessionStoreTests(unittest.TestCase):
             writer.release.assert_called_once()
         self.assertEqual(path.read_bytes(), b"previous video")
         self.assertEqual(len(self.store.frames), 1)
+
+    def test_timeline_preserves_originals_and_reopens_edits(self):
+        for color in ("red", "green", "blue"):
+            self.store.append(Image.new("RGB", (24, 24), color))
+        originals = {path: path.read_bytes() for path in self.store.folder.glob("*.png")}
+        self.assertEqual(playback_order(self.store.timeline), (0, 1, 2))
+        self.assertFalse(self.store.edit_frame(0, hold=1, hidden=False))
+        self.assertFalse((self.store.folder / "timeline.json").exists())
+
+        self.assertTrue(self.store.edit_frame(1, hidden=True))
+        self.assertTrue(self.store.edit_frame(2, hold=3))
+        self.assertEqual(playback_order(self.store.timeline), (0, 2, 2, 2))
+        self.assertTrue(self.store.can_undo_edit)
+        self.assertFalse(self.store.can_redo_edit)
+        self.assertTrue(self.store.undo_edit())
+        self.assertEqual(playback_order(self.store.timeline), (0, 2))
+        self.assertTrue(self.store.redo_edit())
+        self.assertEqual(playback_order(self.store.timeline), (0, 2, 2, 2))
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+        reopened = SessionStore(self.store.base_dir)
+        self.assertEqual(playback_order(reopened.timeline), (0, 2, 2, 2))
+        self.assertEqual([(item.hold, item.hidden) for item in reopened.timeline],
+                         [(1, False), (1, True), (3, False)])
+        self.assertEqual(len(reopened.frames), 3)
+        self.assertFalse(reopened.can_undo_edit)
+
+    def test_failed_edit_and_undo_leave_previous_manifest_and_history_intact(self):
+        self.store.append(Image.new("RGB", (24, 24)))
+        self.store.edit_frame(0, hold=2)
+        timeline = self.store.folder / "timeline.json"
+        saved = timeline.read_bytes()
+        with patch("sessions.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.store.edit_frame(0, hidden=True)
+            with self.assertRaises(OSError):
+                self.store.undo_edit()
+
+        self.assertEqual(timeline.read_bytes(), saved)
+        self.assertEqual(playback_order(self.store.timeline), (0, 0))
+        self.assertTrue(self.store.can_undo_edit)
+        self.assertFalse(self.store.can_redo_edit)
+        self.assertTrue(self.store.undo_edit())
+        self.assertTrue(self.store.can_redo_edit)
+        self.assertTrue(self.store.edit_frame(0, hold=5))
+        self.assertFalse(self.store.can_redo_edit)
+        self.assertFalse(self.store.edit_frame(1, hold=2))
+        for hold in (False, 0, 121, 1.2):
+            with self.subTest(hold=hold), self.assertRaises(ValueError):
+                self.store.edit_frame(0, hold=hold)
+
+    def test_import_natural_order_and_exif_transpose(self):
+        self.store.append(Image.new("RGB", (4, 4), "white"))
+        two = self.root / "照片2.jpg"
+        ten = self.root / "照片10.png"
+        orientation = Image.Exif()
+        orientation[274] = 6
+        Image.new("RGB", (18, 8), (255, 0, 0)).save(two, exif=orientation)
+        Image.new("RGBA", (8, 18), (0, 0, 255, 255)).save(ten)
+        original_bytes = [path.read_bytes() for path in (two, ten)]
+        self.assertEqual(self.store.import_images([]), 0)
+        self.assertEqual(self.store.import_images([ten, two]), 2)
+        self.store.append(Image.new("RGB", (4, 4), "green"))
+        self.store.edit_frame(2, hidden=True, hold=4)
+
+        reopened = SessionStore(self.store.base_dir)
+        self.assertEqual([frame.size for frame in reopened.frames], [(4, 4), (8, 18), (8, 18), (4, 4)])
+        self.assertEqual([frame.mode for frame in reopened.frames], ["RGB"] * 4)
+        self.assertGreater(reopened.frames[1].getpixel((0, 0))[0], 250)
+        self.assertEqual(reopened.frames[2].getpixel((0, 0)), (0, 0, 255))
+        self.assertEqual(playback_order(reopened.timeline), (0, 1, 3))
+        self.assertEqual([path.read_bytes() for path in (two, ten)], original_bytes)
+        self.assertEqual(len(list(reopened.folder.glob("batch-*"))), 1)
+        self.assertEqual(list(reopened.folder.glob(".importing-*")), [])
+
+    def test_invalid_import_does_not_publish_partial_batch(self):
+        self.store.append(Image.new("RGB", (4, 4), "green"))
+        good = self.root / "01.png"
+        bad = self.root / "02.png"
+        Image.new("RGB", (4, 4), "red").save(good)
+        bad.write_bytes(b"not a photo")
+        files = set(self.store.folder.iterdir())
+        with self.assertRaisesRegex(ValueError, "02.png"):
+            self.store.import_images([bad, good])
+        self.assertEqual(set(self.store.folder.iterdir()), files)
+        reopened = SessionStore(self.store.base_dir)
+        self.assertEqual(len(reopened.frames), 1)
+        self.assertEqual(reopened.frames[0].getpixel((0, 0)), (0, 128, 0))
+
+    def test_exports_share_edited_frame_sequence_and_duration(self):
+        import cv2
+
+        for color in ("red", "lime", "blue"):
+            self.store.append(Image.new("RGB", (24, 24), color))
+        self.store.edit_frame(1, hidden=True)
+        self.store.edit_frame(2, hold=3)
+        gif = self.root / "edited.gif"
+        mp4 = self.root / "edited.mp4"
+        self.store.export_gif(gif, 10)
+        self.store.export_mp4(mp4, 10)
+        with Image.open(gif) as film:
+            self.assertEqual(film.n_frames, 2)
+            for index, expected in enumerate([((255, 0, 0), 100), ((0, 0, 255), 300)]):
+                film.seek(index)
+                self.assertEqual((film.convert("RGB").getpixel((8, 8)), film.info["duration"]), expected)
+        reader = cv2.VideoCapture(str(mp4))
+        try:
+            self.assertAlmostEqual(reader.get(cv2.CAP_PROP_FPS), 10)
+            channels = []
+            while True:
+                ok, pixels = reader.read()
+                if not ok:
+                    break
+                channels.append(int(pixels[8, 8].argmax()))
+            self.assertEqual(channels, [2, 0, 0, 0])
+        finally:
+            reader.release()
+
+        for index in range(3):
+            self.store.edit_frame(index, hidden=True)
+        for export, path in [(self.store.export_gif, gif), (self.store.export_mp4, mp4)]:
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "可见帧"):
+                export(path, 10)
+            self.assertEqual(path.read_bytes(), before)

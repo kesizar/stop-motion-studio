@@ -7,6 +7,8 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 
+from capture_region import CaptureRegion
+
 
 class HandDetector:
     """Use model bytes so native Windows code never has to resolve the Unicode project path."""
@@ -22,12 +24,21 @@ class HandDetector:
         self.detector = mp.tasks.vision.HandLandmarker.create_from_options(options)
         self.last_ms = -1
 
-    def sees_hand(self, rgb, now):
+    def sees_hand(self, rgb, now, region: CaptureRegion | None = None) -> bool:
         stamp = max(self.last_ms + 1, int(now * 1000))
         self.last_ms = stamp
         image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
         result = self.detector.detect_for_video(image, stamp)
-        return bool(result.hand_landmarks)
+        if region is None:
+            return bool(result.hand_landmarks)
+        for hand in result.hand_landmarks:
+            if not hand:
+                continue
+            xs = [landmark.x for landmark in hand]
+            ys = [landmark.y for landmark in hand]
+            if region.intersects((min(xs), min(ys), max(xs), max(ys))):
+                return True
+        return False
 
     def __enter__(self):
         return self
@@ -42,7 +53,17 @@ class CameraFeed:
         self.latest = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.hand_sequence = 0
+        self._region = None
+        self._region_revision = 0
+        self._region_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def set_region(self, region: CaptureRegion | None) -> tuple[int, int]:
+        """Return the new region revision and its starting hand sequence."""
+        with self._region_lock:
+            self._region = region
+            self._region_revision += 1
+            return self._region_revision, self.hand_sequence
 
     def _publish(self, item):
         try:
@@ -73,11 +94,16 @@ class CameraFeed:
                         raise RuntimeError("摄像头画面中断。重新连接设备后再开始拍摄。")
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     now = time.monotonic()
-                    hand_present = hands.sees_hand(rgb, now)
-                    # Carry a hand sighting across dropped preview frames.
-                    if hand_present:
-                        self.hand_sequence += 1
-                    self._publish((frame, hand_present, now, self.hand_sequence))
+                    with self._region_lock:
+                        region, revision = self._region, self._region_revision
+                    hand_present = hands.sees_hand(rgb, now, region)
+                    with self._region_lock:
+                        if revision != self._region_revision:
+                            continue
+                        # Carry sightings across dropped preview frames in this region.
+                        if hand_present:
+                            self.hand_sequence += 1
+                        self._publish((frame, hand_present, now, self.hand_sequence, revision))
         except Exception as exc:
             self._publish(str(exc))
         finally:
@@ -96,7 +122,7 @@ class DemoFeed:
     def __init__(self):
         self.started = time.monotonic()
 
-    def read(self, now):
+    def read(self, now, region: CaptureRegion | None = None):
         elapsed = max(0.0, now - self.started)
         cycle, phase = divmod(max(0.0, elapsed - 1.6), 2.5)
         cycle = int(cycle)
@@ -114,4 +140,6 @@ class DemoFeed:
         draw.line([(x, 113), (x, 167)], fill=(79, 78, 63), width=3)
         if hand:
             draw.line([(x+53, 0), (x+10, 144)], fill=(218, 184, 137), width=24)
+            if region is not None:
+                hand = region.intersects(((x - 2) / 640, 0, (x + 65) / 640, 156 / 360))
         return np.asarray(scene)[:, :, ::-1], hand

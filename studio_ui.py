@@ -55,6 +55,14 @@ class StudioUI:
         self._thumbnail_images = {}
         self._visible_tiles = {}
         self._page_start = 0
+        self._timeline_edits = ()
+        self._edit_controls = None
+        self._hold = tk.StringVar(root, value="1")
+        self._region = None
+        self._region_available = False
+        self._region_selecting = False
+        self._drag_start = None
+        self._drag_end = None
         self._position = None
         self._playing = False
         self._reviewing = False
@@ -83,14 +91,16 @@ class StudioUI:
         self._build_timeline()
 
         for key, action in (
-            ("<Control-z>", self.undo_button),
+            ("<Control-z>", self.edit_undo_button),
+            ("<Control-y>", self.edit_redo_button),
             ("<Control-s>", self.export_button),
             ("<space>", self.play_button),
             ("<Left>", self.previous_frame_button),
             ("<Right>", self.next_frame_button),
-            ("<Escape>", self.resume_button),
         ):
             root.bind(key, lambda event, target=action: self._shortcut(event, target))
+        root.bind("<Escape>", self._escape)
+        self.set_edit_controls(available=False, hold=1, hidden=False, can_undo=False, can_redo=False)
         self.set_capture_controls(available=False, paused=False, can_capture=False)
         self.set_reviewing(False)
         self.set_timeline([])
@@ -143,6 +153,12 @@ class StudioUI:
             viewer_header, "返回取景", self.controller.resume_preview, compact=True,
         )
         self.resume_button.pack(side="right")
+        self.region_clear_button = button(viewer_header, "清除区域", self._clear_region, compact=True)
+        self.region_clear_button.pack(side="right", padx=(4, 6))
+        self.region_select_button = button(viewer_header, "框选区域", self._toggle_region_selection, compact=True)
+        self.region_select_button.pack(side="right")
+        self.region_clear_button.config(state="disabled")
+        self.region_select_button.config(state="disabled")
 
         self.preview = tk.Canvas(card, bg=VIEWPORT, highlightthickness=0, width=250, height=130)
         self.preview.grid(row=1, column=0, sticky="nsew")
@@ -150,7 +166,13 @@ class StudioUI:
         self._placeholder = self.preview.create_text(
             0, 0, text="打开摄像头，或先试用演示", fill=MUTED, font=(FONT, 11),
         )
+        self._region_outline = self.preview.create_rectangle(
+            0, 0, 0, 0, outline=GREEN, width=2, dash=(5, 3), state="hidden",
+        )
         self.preview.bind("<Configure>", self._queue_preview)
+        self.preview.bind("<ButtonPress-1>", self._start_region_drag)
+        self.preview.bind("<B1-Motion>", self._move_region_drag)
+        self.preview.bind("<ButtonRelease-1>", self._finish_region_drag)
 
         self._progress_bar = tk.Canvas(card, height=4, bg=SURFACE, highlightthickness=0)
         self._progress_bar.grid(row=2, column=0, sticky="ew")
@@ -178,6 +200,9 @@ class StudioUI:
 
         self.status_label = label(card, "把一个小物件放在镜头前。", 9, fg=MUTED)
         self.status_label.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        self.alignment_label = label(card, "", 9, fg=AMBER)
+        self.alignment_label.grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        self.alignment_label.grid_remove()
 
     def _build_sidebar(self, body):
         controller = self.controller
@@ -246,7 +271,63 @@ class StudioUI:
             row=0, column=1, sticky="ew", padx=(2, 0),
         )
 
+        self.import_button = button(panel, "导入照片序列", controller.import_images)
+        self.import_button.grid(row=11, column=0, sticky="ew", pady=(4, 0))
+
+        self._build_editor(panel)
         self._fit_sidebar(canvas, panel, scrollbar)
+
+    def _build_editor(self, panel):
+        tk.Frame(panel, bg=BORDER, height=1).grid(row=12, column=0, sticky="ew", pady=7)
+        label(panel, "画格剪辑", 11, True).grid(row=13, column=0, sticky="w")
+        hold_row = tk.Frame(panel, bg=PANEL)
+        hold_row.grid(row=14, column=0, sticky="ew", pady=(4, 4))
+        label(hold_row, "停留格数", 9, fg=MUTED).pack(side="left")
+        self.apply_hold_button = button(hold_row, "应用", self._apply_hold, compact=True)
+        self.apply_hold_button.pack(side="right", padx=(4, 0))
+        self.hold_spinbox = tk.Spinbox(
+            hold_row, from_=1, to=120, textvariable=self._hold, width=4, justify="center",
+            bg=SURFACE, fg=INK, disabledbackground=PANEL, disabledforeground=DISABLED,
+            insertbackground=INK, buttonbackground=SURFACE, relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=BORDER, highlightcolor=AMBER, font=(FONT, 9),
+        )
+        self.hold_spinbox.pack(side="right")
+        self.hold_spinbox.bind("<Return>", self._apply_hold)
+        self.hide_frame_button = button(panel, "隐藏画格", self.controller.toggle_selected_hidden)
+        self.hide_frame_button.grid(row=15, column=0, sticky="ew")
+        history = self._paired_row(panel, 16)
+        self.edit_undo_button = button(history, "撤销剪辑", self.controller.undo_edit)
+        self.edit_undo_button.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=(4, 0))
+        self.edit_redo_button = button(history, "重做剪辑", self.controller.redo_edit)
+        self.edit_redo_button.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(4, 0))
+
+    def _apply_hold(self, _event=None):
+        if str(self.hold_spinbox.cget("state")) != "disabled":
+            try:
+                count = int(self._hold.get())
+            except ValueError:
+                count = 0
+            if 1 <= count <= 120:
+                self.controller.set_selected_hold(count)
+            else:
+                self.set_status("停留格数请输入 1 到 120 的整数。")
+        return "break"
+
+    def set_edit_controls(self, *, available, hold, hidden, can_undo, can_redo):
+        controls = (available, hold, hidden, can_undo, can_redo)
+        if controls == self._edit_controls:
+            return
+        if self._edit_controls is None or (available, hold) != self._edit_controls[:2]:
+            self._hold.set(str(hold))
+        self._edit_controls = controls
+        enabled = "normal" if available else "disabled"
+        self.hold_spinbox.config(state=enabled)
+        self.apply_hold_button.config(state=enabled)
+        self.hide_frame_button.config(
+            state=enabled, text="恢复显示" if hidden else "隐藏画格",
+        )
+        self.edit_undo_button.config(state="normal" if can_undo else "disabled")
+        self.edit_redo_button.config(state="normal" if can_redo else "disabled")
 
     @staticmethod
     def _fit_sidebar(canvas, panel, scrollbar):
@@ -331,7 +412,7 @@ class StudioUI:
     @staticmethod
     def _shortcut(event, action):
         widget_class = event.widget.winfo_class()
-        if widget_class in {"TCombobox", "Entry", "TEntry", "Text", "Listbox"}:
+        if widget_class in {"TCombobox", "Entry", "TEntry", "Text", "Listbox", "Spinbox"}:
             return None
         if event.keysym == "space" and widget_class in {"Button", "Checkbutton"}:
             return None
@@ -416,12 +497,124 @@ class StudioUI:
             mode = "动画回放"
         elif self._reviewing:
             mode = "逐帧检查"
+        elif self._region_selecting:
+            mode = "拖动画面框选 · Esc 取消"
         else:
             mode = "取景预览"
         self.viewer_label.config(text=mode)
         self.source_label.config(text=self._source)
         self.resume_button.config(state="normal" if self._reviewing else "disabled")
         self.onion_button.config(state="disabled" if self._playing or self._reviewing else "normal")
+
+    def _escape(self, event):
+        if self._region_selecting:
+            self._set_region_selecting(False)
+            return "break"
+        return self._shortcut(event, self.resume_button)
+
+    def set_region_controls(self, *, available, region):
+        if (available, region) == (self._region_available, self._region):
+            return
+        self._region_available, self._region = available, region
+        if not available and self._region_selecting:
+            self._set_region_selecting(False)
+        self.region_select_button.config(state="normal" if available else "disabled")
+        self.region_clear_button.config(state="normal" if available and region else "disabled")
+        self._draw_region()
+
+    def _set_region_selecting(self, active):
+        if self._region_selecting == active:
+            return
+        self._region_selecting = active
+        self._drag_start = self._drag_end = None
+        self.preview.config(cursor="crosshair" if active else "")
+        self.region_select_button.config(text="取消框选" if active else "框选区域")
+        self._sync_viewer_mode()
+        self._draw_region()
+        self.controller.set_region_selecting(active)
+
+    def _toggle_region_selection(self):
+        if self._region_available:
+            self._set_region_selecting(not self._region_selecting)
+            if self._region_selecting:
+                self.preview.focus_set()
+
+    def _clear_region(self):
+        self._set_region_selecting(False)
+        self.controller.set_capture_region(None)
+
+    def _region_point(self, event, *, clamp):
+        bounds = self.preview.bbox(self._preview_item)
+        if not bounds or self._photo is None:
+            return None
+        left, top, right, bottom = bounds
+        x = (event.x - left) / (right - left)
+        y = (event.y - top) / (bottom - top)
+        if clamp:
+            return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            return x, y
+        return None
+
+    def _start_region_drag(self, event):
+        if self._region_selecting:
+            self._drag_start = self._drag_end = self._region_point(event, clamp=False)
+            self._draw_region()
+            return "break"
+        return None
+
+    def _move_region_drag(self, event):
+        if self._drag_start is not None:
+            self._drag_end = self._region_point(event, clamp=True)
+            self._draw_region()
+            return "break"
+        return None
+
+    def _drag_region(self):
+        if self._drag_start is None or self._drag_end is None:
+            return None
+        x0, y0 = self._drag_start
+        x1, y1 = self._drag_end
+        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+    def _finish_region_drag(self, event):
+        if self._drag_start is None:
+            return None
+        self._drag_end = self._region_point(event, clamp=True)
+        region = self._drag_region()
+        if region is not None and region[2] - region[0] >= 0.01 and region[3] - region[1] >= 0.01:
+            self.controller.set_capture_region(region)
+            self._set_region_selecting(False)
+        else:
+            self._drag_start = self._drag_end = None
+            self._draw_region()
+        return "break"
+
+    def _draw_region(self):
+        region = self._drag_region() or self._region
+        bounds = self.preview.bbox(self._preview_item)
+        if not self._region_available or self._photo is None or region is None or not bounds:
+            self.preview.itemconfigure(self._region_outline, state="hidden")
+            return
+        left, top, right, bottom = bounds
+        x0, y0, x1, y1 = region
+        width, height = right - left, bottom - top
+        self.preview.coords(
+            self._region_outline, left + x0 * width, top + y0 * height,
+            left + x1 * width, top + y1 * height,
+        )
+        self.preview.itemconfigure(
+            self._region_outline, state="normal", outline=AMBER if self._region_selecting else GREEN,
+        )
+
+    def set_alignment_status(self, text):
+        if self.alignment_label.cget("text") == text:
+            return
+        self.alignment_label.config(text=text)
+        if text:
+            self.alignment_label.grid()
+        else:
+            self.alignment_label.grid_remove()
 
     def set_source(self, label):
         self._source = label
@@ -482,10 +675,12 @@ class StudioUI:
         w, h = self.preview.winfo_width(), self.preview.winfo_height()
         self.preview.coords(self._placeholder, w // 2, h // 2)
         self.status_label.config(wraplength=max(180, w - 12))
+        self.alignment_label.config(wraplength=max(180, w - 12))
         if self._image is None:
             self.preview.itemconfigure(self._placeholder, state="normal")
             self.preview.itemconfigure(self._preview_item, image="")
             self._photo = None
+            self._draw_region()
             return
         if w <= 1 or h <= 1:
             return
@@ -495,6 +690,7 @@ class StudioUI:
         self.preview.itemconfigure(self._placeholder, state="hidden")
         self.preview.coords(self._preview_item, w // 2, h // 2)
         self.preview.itemconfigure(self._preview_item, image=self._photo)
+        self._draw_region()
 
     def set_timeline(self, frames):
         self.frames = frames
@@ -504,11 +700,27 @@ class StudioUI:
             self._page_start = self._last_page_start()
         else:
             self._show_position_page()
-        self.count_label.config(text=f"{len(frames)} 帧")
-        for action in (self.play_button, self.undo_button, self.export_button, self.export_mp4_button):
-            action.config(state="normal" if frames else "disabled")
+        if len(frames) != len(self._timeline_edits):
+            self._timeline_edits = ()
+        self._sync_render_buttons()
         self._sync_timeline_controls()
         self._queue_strip()
+
+    def set_timeline_edits(self, settings):
+        edits = tuple(settings)
+        if edits == self._timeline_edits:
+            return
+        self._timeline_edits = edits
+        self._sync_render_buttons()
+        self._queue_strip()
+
+    def _sync_render_buttons(self):
+        total = len(self.frames)
+        slots = sum(hold for hold, hidden in self._timeline_edits if not hidden) if self._timeline_edits else total
+        self.count_label.config(text=f"{total} 帧" if slots == total else f"{total} 帧 · 成片 {slots} 格")
+        self.undo_button.config(state="normal" if total else "disabled")
+        for action in (self.play_button, self.export_button, self.export_mp4_button):
+            action.config(state="normal" if slots else "disabled")
 
     def set_frame_position(self, index):
         if index is not None and not 0 <= index < len(self.frames):
@@ -517,6 +729,9 @@ class StudioUI:
         if previous == index:
             return
         self._position = index
+        # A value typed but not applied belongs to the previous selection.
+        hold = self._timeline_edits[index][0] if index is not None and index < len(self._timeline_edits) else 1
+        self._hold.set(str(hold))
         self._sync_timeline_controls()
         if index is None:
             self._page_start = self._last_page_start()
@@ -602,8 +817,17 @@ class StudioUI:
                 x, 2, x + TILE_WIDTH, 69, fill=VIEWPORT, outline=BORDER, tags=tags,
             )
             self.strip.create_image(middle, 27, image=photo, tags=tags)
+            hold, hidden = self._timeline_edits[index] if index < len(self._timeline_edits) else (1, False)
+            caption = f"{index + 1:02d}"
+            if hidden:
+                self.strip.create_rectangle(
+                    x + 2, 4, x + TILE_WIDTH - 2, 51, fill=PANEL, stipple="gray50", width=0, tags=tags,
+                )
+                caption += " · 隐藏"
+            elif hold > 1:
+                caption += f" · ×{hold}"
             number = self.strip.create_text(
-                middle, 59, text=f"{index + 1:02d}", fill=MUTED, font=(FONT, 8), tags=tags,
+                middle, 59, text=caption, fill=MUTED, font=(FONT, 8), tags=tags,
             )
             self._visible_tiles[index] = (tile, number)
             self._paint_tile(index)
