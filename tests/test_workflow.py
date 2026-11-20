@@ -4,16 +4,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import tkinter as tk
 from PIL import Image
 
-from app import Studio
+from app import Studio, create_window
 
 
 class StudioWorkflowTest(unittest.TestCase):
     def test_demo_capture_undo_playback_export_and_return_to_real_project(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = tk.Tk()
+            root = create_window()
             root.withdraw()
             studio = Studio(root, Path(directory) / "projects")
             self.addCleanup(studio.close)

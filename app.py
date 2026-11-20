@@ -1,5 +1,8 @@
 """定格动画工作台的本机入口。"""
+import os
 import queue
+import shutil
+import sys
 import tempfile
 import time
 import tkinter as tk
@@ -13,6 +16,31 @@ from sessions import SessionStore
 from shutter import ShutterGate
 from sources import CameraFeed, DemoFeed
 from studio_ui import StudioUI
+
+
+def create_window():
+    """Make Tcl/Tk scripts accessible when a WindowsApps Python backs the venv."""
+    base = Path(sys.base_prefix)
+    prefix = Path(sys.prefix)
+    if os.name == "nt" and prefix != base and "windowsapps" in (part.lower() for part in base.parts):
+        # Python can read the packaged files, but native Tcl may not see them
+        # when started from Explorer. Use scripts from this exact interpreter.
+        cache = prefix / f"tk-runtime-{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        tcl_dir = f"tcl{tk.TclVersion}"
+        tk_dir = f"tk{tk.TkVersion}"
+        if not cache.is_dir():
+            with tempfile.TemporaryDirectory(dir=prefix) as temporary:
+                staging = Path(temporary) / "libraries"
+                for name in (tcl_dir, tk_dir):
+                    shutil.copytree(base / "tcl" / name, staging / name)
+                try:
+                    staging.rename(cache)
+                except FileExistsError:
+                    # A second launch finished copying the same libraries first.
+                    pass
+        os.environ["TCL_LIBRARY"] = (cache / tcl_dir).as_posix()
+        os.environ["TK_LIBRARY"] = (cache / tk_dir).as_posix()
+    return tk.Tk()
 
 
 class Studio:
@@ -210,9 +238,8 @@ class Studio:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = create_window()
     studio = Studio(root, Path(__file__).resolve().parent / "作品")
-    import sys
     if '--demo' in sys.argv:
         studio.start_demo()
     root.mainloop()
