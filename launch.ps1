@@ -32,7 +32,12 @@ if (-not (Test-Path -LiteralPath $runtime)) {
 }
 $requirements = Join-Path $PSScriptRoot 'requirements.txt'
 $marker = Join-Path $PSScriptRoot '.venv\installed-requirements.txt'
-$digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $requirements).Hash
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $digest = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($requirements))).Replace('-', '')
+} finally {
+    $sha256.Dispose()
+}
 if ((-not (Test-Path -LiteralPath $marker)) -or (Get-Content -LiteralPath $marker -Raw).Trim() -ne $digest) {
     Write-Host 'Installing project dependencies. First launch requires internet access.'
     & $runtime -m pip install --disable-pip-version-check -r $requirements
