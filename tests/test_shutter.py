@@ -30,10 +30,28 @@ class ShutterTests(unittest.TestCase):
         self.assertEqual(self.observe(scene(42), hand=True, ticks=15), 0)
         self.assertEqual(self.observe(scene(42), ticks=20), 1)
 
+    def test_progress_restarts_after_motion_or_hand_and_clears_after_capture(self):
+        self.assertIsNone(self.gate.settle_progress)
+        self.observe(scene())
+        self.assertEqual(self.gate.settle_progress, 0.0)
+        self.observe(scene(), ticks=2)
+        self.assertAlmostEqual(self.gate.settle_progress, 0.2 / self.gate.settle_seconds)
+        self.observe(scene(68))
+        self.assertEqual(self.gate.settle_progress, 0.0)
+        self.observe(scene(68), hand=True)
+        self.assertIsNone(self.gate.settle_progress)
+        self.observe(scene(68))
+        self.assertEqual(self.gate.settle_progress, 0.0)
+        self.assertEqual(self.observe(scene(68), ticks=7), 1)
+        self.assertIsNone(self.gate.settle_progress)
+        self.observe(scene(68))
+        self.assertIsNone(self.gate.settle_progress)
+
     def test_stable_unchanged_scene_consumes_intervention(self):
         self.gate.reset(scene())
         self.observe(scene(), hand=True)
         self.assertEqual(self.observe(scene(), ticks=12), 0)
+        self.assertIsNone(self.gate.settle_progress)
         self.assertEqual(self.observe(scene(50), ticks=12), 0)
 
     def test_slow_motion_and_brief_hand_tracking_dropout(self):
@@ -64,6 +82,7 @@ class ShutterTests(unittest.TestCase):
         changed = frame.copy()
         changed[:, :80] = (220, 10, 180)
         self.assertEqual(self.observe(changed, ticks=20), 0)
+        self.assertIsNone(self.gate.settle_progress)
         self.assertEqual(self.observe(scene(42), ticks=12), 1)
 
     def test_disconnect_is_not_observed_stability(self):

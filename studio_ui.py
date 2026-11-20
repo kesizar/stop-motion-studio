@@ -44,6 +44,7 @@ class StudioUI:
         self._source = "待机"
         self._camera = tk.StringVar(root, value="0")
         self._fps = tk.StringVar(root, value="8")
+        self._onion_skin = tk.BooleanVar(root, value=False)
         root.title("逐格 · 定格动画工作台")
         root.geometry("1040x720")
         root.minsize(740, 550)
@@ -73,8 +74,29 @@ class StudioUI:
             0, 0, text="打开摄像头，或在右侧试用演示", fill="#c4d6dc", font=(FONT, 11)
         )
         self.preview.bind("<Configure>", self._queue_preview)
+
+        self._progress_value = None
+        self._progress_captured = False
+        self._progress_bar = tk.Canvas(card, height=5, bg="#eaf1f2", highlightthickness=0)
+        self._progress_bar.grid(row=2, column=0, sticky="ew", padx=7)
+        self._progress_fill = self._progress_bar.create_rectangle(0, 0, 0, 5, width=0, state="hidden")
+        self._progress_bar.bind("<Configure>", self._draw_capture_progress)
+
+        capture_controls = tk.Frame(card, bg=PAPER)
+        capture_controls.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 0))
+        tk.Checkbutton(
+            capture_controls, text="上一帧叠影", variable=self._onion_skin,
+            command=lambda: controller.set_onion_skin(self._onion_skin.get()),
+            bg=PAPER, fg=INK, activebackground=PAPER, font=(FONT, 9), padx=0, pady=0,
+        ).pack(side="left")
+        self.capture_button = button(capture_controls, "手动拍一帧", controller.manual_capture)
+        self.capture_button.pack(side="right")
+        self.pause_button = button(capture_controls, "暂停自动快门", controller.toggle_auto_pause)
+        self.pause_button.pack(side="right", padx=(6, 4))
+        self.set_capture_controls(available=False, paused=False, can_capture=False)
+
         self.status_label = label(card, "把一个小物件放在镜头前。", fg=MUTED)
-        self.status_label.grid(row=2, column=0, sticky="ew", padx=12, pady=5)
+        self.status_label.grid(row=4, column=0, sticky="ew", padx=12, pady=5)
 
         panel = tk.Frame(body, bg=PAPER, padx=12, pady=7)
         panel.grid(row=0, column=1, sticky="ns", padx=(9, 0))
@@ -168,6 +190,36 @@ class StudioUI:
 
     def set_status(self, text):
         self.status_label.config(text=text)
+
+    def set_capture_controls(self, *, available, paused, can_capture):
+        self.pause_button.config(
+            text="恢复自动快门" if paused else "暂停自动快门",
+            state="normal" if available else "disabled",
+        )
+        self.capture_button.config(state="normal" if available and can_capture else "disabled")
+
+    def set_capture_progress(self, progress, *, captured=False):
+        if (progress, captured) == (self._progress_value, self._progress_captured):
+            return
+        self._progress_value = progress
+        self._progress_captured = captured
+        self._progress_bar.itemconfigure(
+            self._progress_fill, state="hidden" if progress is None else "normal",
+            fill="#208052" if captured else "#cf8218",
+        )
+        self._draw_capture_progress()
+
+    def _draw_capture_progress(self, _event=None):
+        if self._progress_value is not None:
+            width = round(self._progress_bar.winfo_width() * self._progress_value)
+            self._progress_bar.coords(self._progress_fill, 0, 0, width, 5)
+
+    def cancel_pending_draws(self):
+        for job in (self._resize_job, self._strip_job):
+            if job is not None:
+                self.root.after_cancel(job)
+        self._resize_job = None
+        self._strip_job = None
 
     def show_frame(self, rgb):
         self._image = rgb

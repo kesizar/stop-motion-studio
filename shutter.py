@@ -52,6 +52,7 @@ class ShutterGate:
         self.reset()
 
     def reset(self, reference: Optional[np.ndarray] = None) -> None:
+        self.settle_progress: Optional[float] = None
         self._reference = None if reference is None else _sample(reference)
         self._armed = reference is None
         self._anchor = None
@@ -61,6 +62,7 @@ class ShutterGate:
 
     def update(self, frame: np.ndarray, hand_present: bool, now: float) -> tuple[bool, str]:
         """Return the capture decision and a user-facing Chinese status."""
+        self.settle_progress = None
         previous_time = self._last_time
         self._last_time = now
         if hand_present:
@@ -76,9 +78,12 @@ class ShutterGate:
             self._anchor = sample
             self._stable_since = now
             self._stable_samples = 1
+            self.settle_progress = 0.0
             return False, "等待画面稳定"
         self._stable_samples += 1
-        if now - self._stable_since < self.settle_seconds or self._stable_samples < self.min_stable_samples:
+        elapsed = now - self._stable_since
+        if elapsed < self.settle_seconds or self._stable_samples < self.min_stable_samples:
+            self.settle_progress = elapsed / self.settle_seconds if elapsed < self.settle_seconds else 1.0
             return False, "等待画面稳定"
 
         change = "localized" if self._reference is None else _change(self._reference, sample)
