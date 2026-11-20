@@ -34,3 +34,5 @@ Windows 电脑使用带 Tcl/Tk 的 64 位 Python 3.10–3.12，推荐 Python 3.1
 第三方依赖包括 MediaPipe Hand Landmarker、OpenCV、NumPy、Pillow 和 Python 标准库 Tkinter。[MediaPipe Hand Landmarker 概述](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker/python) · [本项目使用的 MediaPipe 版本](https://pypi.org/project/mediapipe/0.10.21/)
 
 手部模型取自 [Google 发布的模型文件（float16，版本 1）](https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task)。应用将模型读取为字节后再交给 MediaPipe，支持中文项目路径。
+
+随项目分发的手部模型采用 Apache License 2.0。[Google 模型卡](https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Hand%20Tracking%20%28Lite_Full%29%20with%20Fairness%20Oct%202021.pdf) · [模型许可证全文](LICENSE-model.txt)
