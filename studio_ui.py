@@ -1,23 +1,30 @@
 """Tkinter application views for the stop-motion workbench."""
 
+from math import tau
 import tkinter as tk
-from tkinter import ttk
+from tkinter import font as tkfont, ttk
 
 from PIL import Image, ImageTk
 
+from halftone import HEADER_BACKGROUND, VIEWER_BACKGROUND, render_halftone
+
 
 FONT = "Microsoft YaHei UI"
-BG = "#111722"
-PANEL = "#1b2432"
-SURFACE = "#273345"
-BORDER = "#34445a"
-INK = "#f1f4f8"
-MUTED = "#a4b2c6"
-DISABLED = "#738199"
-VIEWPORT = "#0b101a"
-AMBER = "#f3b867"
-DARK_INK = "#241a0f"
-GREEN = "#63d6a4"
+BG = VIEWER_BACKGROUND
+HEADER = HEADER_BACKGROUND
+PANEL = "#1b1c20"
+SURFACE = "#292a2e"
+BORDER = "#403f44"
+INK = "#f5eee6"
+MUTED = "#c2b8ae"
+SECTION_INK = "#ead2be"
+DISABLED = "#90867e"
+VIEWPORT = VIEWER_BACKGROUND
+AMBER = "#ffad71"
+DARK_INK = "#282016"
+GREEN = "#83d8b1"
+
+IDLE_TEXTURE_INTERVAL = 200
 
 TILE_WIDTH = 92
 TILE_STEP = 100
@@ -33,7 +40,7 @@ def button(parent, text, command, primary=False, compact=False):
     return tk.Button(
         parent, text=text, command=command,
         bg=AMBER if primary else SURFACE, fg=DARK_INK if primary else INK,
-        activebackground="#ffce8c" if primary else BORDER,
+        activebackground="#ffc296" if primary else BORDER,
         activeforeground=DARK_INK if primary else INK, disabledforeground=DISABLED,
         font=(FONT, 9, "bold" if primary else "normal"), relief="flat", borderwidth=0,
         highlightthickness=1, highlightbackground=AMBER if primary else BORDER,
@@ -50,8 +57,15 @@ class StudioUI:
         self.frames = []
         self._image = None
         self._photo = None
+        self._draws_closed = False
         self._resize_job = None
         self._strip_job = None
+        self._masthead_job = None
+        self._masthead_photo = None
+        self._idle_job = None
+        self._idle_photo = None
+        self._idle_size = None
+        self._idle_phase = 0.0
         self._thumbnail_images = {}
         self._visible_tiles = {}
         self._page_start = 0
@@ -79,6 +93,19 @@ class StudioUI:
         root.configure(bg=BG)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
+        families = {family.casefold(): family for family in tkfont.families(root)}
+        display = next(
+            (families[name.casefold()] for name in ("Noto Serif SC", "STZhongsong", "STSong", "SimSun")
+             if name.casefold() in families),
+            FONT,
+        )
+        digits = next(
+            (families[name.casefold()] for name in ("IBM Plex Mono", "Space Mono", "Consolas")
+             if name.casefold() in families),
+            tkfont.nametofont("TkFixedFont", root=root).actual("family"),
+        )
+        self._title_font = tkfont.Font(root=root, family=display, size=30, weight="bold")
+        self._digit_font = (digits, 10)
         self._configure_styles()
         self._build_header()
 
@@ -129,15 +156,55 @@ class StudioUI:
         self.root.option_add("*TCombobox*Listbox.selectForeground", DARK_INK)
 
     def _build_header(self):
-        header = tk.Frame(self.root, bg=BG, padx=15, pady=10)
-        header.grid(row=0, column=0, sticky="ew")
-        label(header, "逐格", 17, True, AMBER, BG).pack(side="left")
-        label(header, "定格动画工作台", 10, fg=MUTED, bg=BG).pack(side="left", padx=(12, 0))
-        self.source_label = label(header, self._source, 9, True, AMBER, SURFACE)
+        height = max(76, self._title_font.metrics("linespace") + 16)
+        self.masthead = tk.Canvas(
+            self.root, bg=HEADER, height=height, highlightthickness=1,
+            highlightbackground=BORDER, borderwidth=0,
+        )
+        self.masthead.grid(row=0, column=0, sticky="ew", padx=14, pady=(11, 10))
+        self._masthead_art = self.masthead.create_image(0, 0, anchor="nw")
+
+        text_y = height // 2
+        self.masthead.create_text(
+            21, text_y + 1, text="逐格", anchor="w", fill="#8f5945", font=self._title_font,
+        )
+        self.masthead.create_text(
+            19, text_y, text="逐格", anchor="w", fill=INK, font=self._title_font,
+        )
+        separator = 37 + self._title_font.measure("逐格")
+        self.masthead.create_line(separator, text_y - 12, separator, text_y + 12, fill="#9e6146")
+        self.masthead.create_text(
+            separator + 15, text_y, text="定格动画工作台", anchor="w",
+            fill=MUTED, font=(FONT, 11),
+        )
+
+        self.source_label = label(self.masthead, self._source, 9, True, AMBER, SURFACE)
         self.source_label.config(padx=9, pady=3)
-        self.source_label.pack(side="right")
-        self.project_label = label(header, "", 9, fg=MUTED, bg=BG)
-        self.project_label.pack(side="right", padx=(0, 12))
+        self._source_window = self.masthead.create_window(0, text_y - 9, anchor="e", window=self.source_label)
+        self.project_label = label(self.masthead, "", 9, fg=MUTED, bg=HEADER)
+        self._project_window = self.masthead.create_window(0, text_y + 16, anchor="e", window=self.project_label)
+        self.masthead.bind("<Configure>", self._queue_masthead)
+
+    def _queue_masthead(self, _event=None):
+        if not self._draws_closed and self._masthead_job is None:
+            self._masthead_job = self.root.after_idle(self._draw_masthead)
+
+    def _draw_masthead(self):
+        self._masthead_job = None
+        size = self.masthead.winfo_width(), self.masthead.winfo_height()
+        if min(size) <= 2:
+            return
+        self._masthead_photo = ImageTk.PhotoImage(render_halftone(size), master=self.root)
+        self.masthead.itemconfigure(self._masthead_art, image=self._masthead_photo)
+        self._position_masthead_status()
+
+    def _position_masthead_status(self):
+        width = self.masthead.winfo_width()
+        middle = self.masthead.winfo_height() // 2
+        has_project = bool(self.project_label.cget("text"))
+        self.masthead.coords(self._source_window, width - 15, middle - 10 if has_project else middle)
+        self.masthead.coords(self._project_window, width - 15, middle + 15)
+        self.masthead.itemconfigure(self._project_window, state="normal" if has_project else "hidden")
 
     def _build_preview(self, body):
         card = tk.Frame(body, bg=PANEL, padx=10, pady=8)
@@ -162,14 +229,17 @@ class StudioUI:
 
         self.preview = tk.Canvas(card, bg=VIEWPORT, highlightthickness=0, width=250, height=130)
         self.preview.grid(row=1, column=0, sticky="nsew")
+        self._idle_art = self.preview.create_image(0, 0, anchor="nw", state="hidden")
         self._preview_item = self.preview.create_image(0, 0)
         self._placeholder = self.preview.create_text(
-            0, 0, text="打开摄像头，或先试用演示", fill=MUTED, font=(FONT, 11),
+            0, 0, text="打开摄像头，或先试用演示", fill=INK, font=(FONT, 12),
         )
         self._region_outline = self.preview.create_rectangle(
             0, 0, 0, 0, outline=GREEN, width=2, dash=(5, 3), state="hidden",
         )
         self.preview.bind("<Configure>", self._queue_preview)
+        self.preview.bind("<Map>", self._queue_preview, add="+")
+        self.preview.bind("<Unmap>", self._stop_idle_animation, add="+")
         self.preview.bind("<ButtonPress-1>", self._start_region_drag)
         self.preview.bind("<B1-Motion>", self._move_region_drag)
         self.preview.bind("<ButtonRelease-1>", self._finish_region_drag)
@@ -222,7 +292,7 @@ class StudioUI:
         panel.columnconfigure(0, weight=1)
         canvas.create_window(0, 0, window=panel, anchor="nw")
 
-        label(panel, "拍摄", 11, True).grid(row=0, column=0, sticky="w")
+        label(panel, "拍摄", 11, True, SECTION_INK).grid(row=0, column=0, sticky="w")
         selector = tk.Frame(panel, bg=PANEL)
         selector.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         label(selector, "摄像头编号", 9, fg=MUTED).pack(side="left")
@@ -242,7 +312,7 @@ class StudioUI:
         )
 
         tk.Frame(panel, bg=BORDER, height=1).grid(row=4, column=0, sticky="ew", pady=7)
-        label(panel, "回放与导出", 11, True).grid(row=5, column=0, sticky="w")
+        label(panel, "回放与导出", 11, True, SECTION_INK).grid(row=5, column=0, sticky="w")
         speed_row = tk.Frame(panel, bg=PANEL)
         speed_row.grid(row=6, column=0, sticky="ew", pady=(4, 4))
         label(speed_row, "速度（帧 / 秒）", 9, fg=MUTED).pack(side="left", padx=(0, 12))
@@ -279,7 +349,7 @@ class StudioUI:
 
     def _build_editor(self, panel):
         tk.Frame(panel, bg=BORDER, height=1).grid(row=12, column=0, sticky="ew", pady=7)
-        label(panel, "画格剪辑", 11, True).grid(row=13, column=0, sticky="w")
+        label(panel, "画格剪辑", 11, True, SECTION_INK).grid(row=13, column=0, sticky="w")
         hold_row = tk.Frame(panel, bg=PANEL)
         hold_row.grid(row=14, column=0, sticky="ew", pady=(4, 4))
         label(hold_row, "停留格数", 9, fg=MUTED).pack(side="left")
@@ -376,7 +446,7 @@ class StudioUI:
 
         strip_header = tk.Frame(timeline, bg=PANEL)
         strip_header.grid(row=0, column=0, sticky="ew")
-        label(strip_header, "时间轴", 11, True).pack(side="left")
+        label(strip_header, "时间轴", 11, True, SECTION_INK).pack(side="left")
         self.count_label = label(strip_header, "0 帧", 9, fg=MUTED)
         self.count_label.pack(side="left", padx=(7, 0))
         self.next_button = button(strip_header, "后页 ›", lambda: self._turn_page(1), compact=True)
@@ -392,7 +462,7 @@ class StudioUI:
         )
         self.previous_frame_button.pack(side="right")
         self.frame_label = label(strip_header, "— / —", 9, fg=MUTED)
-        self.frame_label.config(anchor="e")
+        self.frame_label.config(anchor="e", font=self._digit_font)
         self.frame_label.pack(side="right", padx=(8, 10))
 
         self.strip = tk.Canvas(timeline, height=71, width=200, bg=PANEL, highlightthickness=0)
@@ -437,6 +507,7 @@ class StudioUI:
 
     def set_project(self, name):
         self.project_label.config(text=self._project_title(name) if name else "")
+        self._position_masthead_status()
 
     def choose_project(self, names, current):
         """Return a chosen session name. Closing the dialog leaves it unchanged."""
@@ -656,18 +727,48 @@ class StudioUI:
             self._progress_bar.coords(self._progress_fill, 0, 0, width, 4)
 
     def cancel_pending_draws(self):
-        for job in (self._resize_job, self._strip_job):
+        self._draws_closed = True
+        for job in (self._resize_job, self._strip_job, self._masthead_job):
             if job is not None:
                 self.root.after_cancel(job)
         self._resize_job = None
         self._strip_job = None
+        self._masthead_job = None
+        self._stop_idle_animation()
+
+    def _draw_idle_texture(self, size):
+        width, height = size
+        scale = min(1, 1100 / width, 650 / height)
+        sampled = (max(1, round(width * scale)), max(1, round(height * scale)))
+        image = render_halftone(sampled, variant="viewer", phase=self._idle_phase)
+        if sampled != size:
+            image = image.resize(size, Image.Resampling.BILINEAR)
+        self._idle_photo = ImageTk.PhotoImage(image, master=self.root)
+        self._idle_size = size
+        self.preview.itemconfigure(self._idle_art, image=self._idle_photo, state="normal")
+
+    def _animate_idle_texture(self):
+        self._idle_job = None
+        if self._draws_closed or self._image is not None or not self.preview.winfo_ismapped():
+            return
+        size = self.preview.winfo_width(), self.preview.winfo_height()
+        if min(size) <= 1:
+            return
+        self._idle_phase = (self._idle_phase + 0.10) % tau
+        self._draw_idle_texture(size)
+        self._idle_job = self.root.after(IDLE_TEXTURE_INTERVAL, self._animate_idle_texture)
+
+    def _stop_idle_animation(self, _event=None):
+        if self._idle_job is not None:
+            self.root.after_cancel(self._idle_job)
+            self._idle_job = None
 
     def show_frame(self, rgb):
         self._image = rgb
         self._queue_preview()
 
     def _queue_preview(self, _event=None):
-        if self._resize_job is None:
+        if not self._draws_closed and self._resize_job is None:
             self._resize_job = self.root.after_idle(self._draw_preview)
 
     def _draw_preview(self):
@@ -680,8 +781,17 @@ class StudioUI:
             self.preview.itemconfigure(self._placeholder, state="normal")
             self.preview.itemconfigure(self._preview_item, image="")
             self._photo = None
+            if min(w, h) > 1 and self._idle_size != (w, h):
+                self._draw_idle_texture((w, h))
+            if self._idle_job is None and self.preview.winfo_ismapped():
+                self._idle_job = self.root.after(IDLE_TEXTURE_INTERVAL, self._animate_idle_texture)
             self._draw_region()
             return
+        if self._idle_photo is not None:
+            self._stop_idle_animation()
+            self.preview.itemconfigure(self._idle_art, image="", state="hidden")
+            self._idle_photo = None
+            self._idle_size = None
         if w <= 1 or h <= 1:
             return
         scale = min(w / self._image.width, h / self._image.height)
@@ -779,7 +889,7 @@ class StudioUI:
         self._queue_strip()
 
     def _queue_strip(self):
-        if self._strip_job is None:
+        if not self._draws_closed and self._strip_job is None:
             self._strip_job = self.root.after_idle(self._draw_strip)
 
     def _draw_strip(self):
