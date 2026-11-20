@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+作品/
+.env
+.env.*
+Thumbs.db
+Desktop.ini
