@@ -1,7 +1,8 @@
-"""Local PNG frame storage and GIF export for the stop-motion workbench."""
+"""Local PNG frame storage and animation export for the stop-motion workbench."""
 
 import os
 import re
+import shutil
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -127,12 +128,16 @@ class SessionStore:
         self._cache.pop(path, None)
         return True
 
-    def export_gif(self, path: Path, fps: int):
+    def _export_frames(self, fps: int) -> list[Image.Image]:
         if type(fps) is not int or not 1 <= fps <= 100:
             raise ValueError("帧率必须是 1 至 100 之间的整数")
         frames = self.frames
         if not frames:
             raise ValueError("请先拍摄至少一帧")
+        return frames
+
+    def export_gif(self, path: Path, fps: int):
+        frames = self._export_frames(fps)
 
         # A camera change can produce frames with a different aspect ratio.
         size = frames[0].size
@@ -155,3 +160,54 @@ class SessionStore:
                 loop=0,
                 disposal=2,
             )
+
+
+    def export_mp4(self, path: Path, fps: int) -> None:
+        """Encode a silent, constant-frame-rate video, then publish it atomically."""
+        frames = self._export_frames(fps)
+        try:
+            import cv2
+        except ImportError as error:
+            raise OSError("导出 MP4 需要 OpenCV。请运行启动脚本安装依赖。") from error
+        import numpy as np
+
+        source_size = frames[0].size
+        video_size = tuple(side + side % 2 for side in source_size)
+        # Keep the user-selected destination out of the native encoder. Python
+        # handles its path and can replace the old export only after validation.
+        with tempfile.TemporaryDirectory(prefix="stopmotion-mp4-") as temporary:
+            staged = Path(temporary) / "video.mp4"
+            video_path = str(staged)
+            try:
+                writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, video_size)
+                try:
+                    if not writer.isOpened():
+                        raise OSError("无法启动 MP4 编码器。请确认 OpenCV 支持 mp4v。")
+                    for frame in frames:
+                        if frame.size != source_size:
+                            frame = ImageOps.pad(frame, source_size, color="black")
+                        # Video encoders often truncate odd dimensions. Add an
+                        # extra row or column while retaining every input pixel.
+                        if source_size != video_size:
+                            padded = Image.new("RGB", video_size)
+                            padded.paste(frame, (0, 0))
+                            frame = padded
+                        writer.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
+                finally:
+                    writer.release()
+
+                if not staged.is_file() or not staged.stat().st_size:
+                    raise OSError("MP4 编码器没有生成视频。")
+                reader = cv2.VideoCapture(video_path)
+                try:
+                    ok, first = reader.read()
+                    if (not ok or (first.shape[1], first.shape[0]) != video_size
+                            or reader.get(cv2.CAP_PROP_FRAME_COUNT) != len(frames)):
+                        raise OSError("生成的 MP4 无法读取或帧数不完整。")
+                finally:
+                    reader.release()
+            except cv2.error as error:
+                raise OSError(f"MP4 编码失败：{error}") from error
+
+            with staged.open("rb") as video, _atomic_output(path) as output:
+                shutil.copyfileobj(video, output)

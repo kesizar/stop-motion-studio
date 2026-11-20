@@ -66,7 +66,10 @@ class Studio:
         self.wait_for_hand = False
         self.gate = ShutterGate()
         self.playing = False
+        self.inspection_index = None
+        self.project_frames = []
         self.play_index = 0
+        self.play_position = 0
         self.next_frame = 0.0
         self.fps = 8
         self.ui = StudioUI(root, self)
@@ -81,9 +84,17 @@ class Studio:
         if frames is None:
             frames = self.store.frames
         self.ui.set_project("" if self.demo_dir is not None else self.store.folder.name)
+        self.project_frames = frames
         self.reference_frame = frames[-1] if frames else None
         self.ui.set_timeline(frames)
-        self._show_preview()
+        if self.inspection_index is not None and frames:
+            self.inspection_index = min(self.inspection_index, len(frames) - 1)
+            self._show_frame_index(self.inspection_index)
+        else:
+            self.inspection_index = None
+            self.ui.set_reviewing(False)
+            self.ui.set_frame_position(None)
+            self._show_preview()
         return len(frames)
 
     def _show_preview(self):
@@ -101,7 +112,11 @@ class Studio:
         self.gate.reset(np.asarray(ref)[:, :, ::-1] if ref is not None else None)
 
     def _has_live_preview(self):
-        return not self.playing and (self.camera is not None or self.demo is not None)
+        return (
+            not self.playing
+            and self.inspection_index is None
+            and (self.camera is not None or self.demo is not None)
+        )
 
     def _can_capture(self, now):
         return (
@@ -155,7 +170,7 @@ class Studio:
         if self.demo is not None and count >= DEMO_FRAME_LIMIT:
             self.stop_source()
             self.ui.set_capture_progress(1, captured=True)
-            self.ui.set_status(f"演示已拍好 {count} 帧。点「回放」看纸船移动，或导出 GIF。")
+            self.ui.set_status(f"演示已拍好 {count} 帧。点「回放」看纸船移动，或导出 GIF / MP4。")
             return
         self._show_capture_status(now, None, "")
 
@@ -186,6 +201,9 @@ class Studio:
         self.auto_paused = False
         self.wait_for_hand = False
         self._stop_playback()
+        self.inspection_index = None
+        self.ui.set_reviewing(False)
+        self.ui.set_frame_position(None)
         self._show_preview()
         self.ui.set_capture_progress(None)
         self._sync_capture_controls(time.monotonic())
@@ -229,15 +247,20 @@ class Studio:
             return callback(*args, **kwargs)
         finally:
             self._dialog_open = False
-            if self._has_live_preview():
-                self.latest_frame = None
-                self.last_observation = None
-                self.capture_notice = None
-                if self.camera is not None:
-                    self.seen_hand = self.camera.hand_sequence
-                self._reset_gate()
-                self.ui.set_capture_progress(None)
+            if self.playing:
+                self.next_frame = 0.0
+            elif self._has_live_preview():
+                self._reset_live_observation()
                 self._sync_capture_controls(time.monotonic())
+
+    def _reset_live_observation(self):
+        self.latest_frame = None
+        self.last_observation = None
+        self.capture_notice = None
+        if self.camera is not None:
+            self.seen_hand = self.camera.hand_sequence
+        self._reset_gate()
+        self.ui.set_capture_progress(None)
 
     def open_project_dialog(self):
         current = self.real_store.folder.name
@@ -282,41 +305,90 @@ class Studio:
 
     def set_fps(self, fps):
         self.fps = min(16, max(2, int(fps)))
+        self.next_frame = 0.0
+
+    def _show_frame_index(self, index):
+        self.ui.show_frame(self.project_frames[index])
+        self.ui.set_frame_position(index)
+
+    def seek_frame(self, index):
+        if not 0 <= index < len(self.project_frames):
+            return
+        self._stop_playback()
+        self.inspection_index = index
+        self.ui.set_reviewing(True)
+        self.ui.set_capture_progress(None)
+        self._sync_capture_controls(time.monotonic())
+        self._show_frame_index(index)
+        self.ui.set_status(f"正在检查第 {index + 1} 帧。点「返回取景」继续拍摄。")
+
+    def step_frame(self, delta):
+        if not self.project_frames:
+            return
+        last = len(self.project_frames) - 1
+        if self.playing:
+            index = self.play_position + delta
+        elif self.inspection_index is None:
+            index = last
+        else:
+            index = self.inspection_index + delta
+        self.seek_frame(max(0, min(last, index)))
+
+    def resume_preview(self):
+        self._stop_playback()
+        self.inspection_index = None
+        self.ui.set_reviewing(False)
+        self.ui.set_frame_position(None)
+        self._reset_live_observation()
+        self._sync_capture_controls(time.monotonic())
+        self._show_preview()
+        if self._has_live_preview():
+            self.ui.set_status("已返回取景。")
+        else:
+            self.ui.set_status("已退出查看。可以打开摄像头或继续回放。")
 
     def playback(self):
         if self.playing:
-            self._stop_playback()
-            self._reset_gate()
-            self._refresh()
-            self._sync_capture_controls(time.monotonic())
-            self.ui.set_status("回放已结束。")
-        elif self.store.frames:
+            self.resume_preview()
+        elif self.project_frames:
+            start = self.inspection_index if self.inspection_index is not None else 0
+            self.play_index = start
+            self.play_position = start
+            self.next_frame = 0.0
+            self.inspection_index = None
             self.playing = True
-            self.latest_frame = None
-            self.last_observation = None
-            self.capture_notice = None
+            self.ui.set_reviewing(False)
+            self.ui.set_playing(True)
             self.ui.set_capture_progress(None)
             self._sync_capture_controls(time.monotonic())
-            self.play_index = 0
-            self.next_frame = 0.0
-            self.ui.set_playing(True)
-            self.ui.set_status("正在循环回放。结束回放后可以继续拍摄。")
+            self._show_frame_index(start)
+            self.ui.set_status("正在循环回放。点击时间轴可以停在指定帧。")
 
     def export_gif(self):
-        if not self.store.frames:
+        self._export_animation("gif", "GIF 动画", self.store.export_gif)
+
+    def export_mp4(self):
+        self._export_animation("mp4", "MP4 视频", self.store.export_mp4)
+
+    def _export_animation(self, extension, label, exporter):
+        if not self.project_frames:
             return
         filename = self._run_dialog(
-            filedialog.asksaveasfilename, parent=self.root, title="保存定格动画",
-            defaultextension=".gif", filetypes=[("GIF 动画", "*.gif")],
-            initialfile="我的定格动画.gif", initialdir=self.real_store.folder.parent,
+            filedialog.asksaveasfilename, parent=self.root, title=f"导出{label}",
+            defaultextension=f".{extension}", filetypes=[(label, f"*.{extension}")],
+            initialfile=f"我的定格动画.{extension}", initialdir=self.real_store.folder.parent,
         )
-        if filename:
-            try:
-                self.store.export_gif(Path(filename), self.fps)
-            except (OSError, ValueError) as exc:
-                messagebox.showerror("导出失败", str(exc), parent=self.root)
-                return
-            self.ui.set_status(f"动画已导出到 {filename}")
+        if not filename:
+            return
+        self.ui.set_status(f"正在导出{label}……")
+        self.root.update_idletasks()
+        try:
+            exporter(Path(filename), self.fps)
+        except (OSError, ValueError) as exc:
+            self.ui.set_status(f"{label}导出失败。")
+            messagebox.showerror("导出失败", str(exc), parent=self.root)
+            return
+        self.ui.set_status(f"{label}已导出到 {filename}")
 
     def _observe(self, frame, hand_present, now):
         # A stalled source provides no evidence of stability over the missing interval.
@@ -348,10 +420,16 @@ class Studio:
             return
         if self.playing:
             if now >= self.next_frame:
-                frames = self.store.frames
-                self.ui.show_frame(frames[self.play_index % len(frames)])
+                if not self.next_frame:
+                    self.next_frame = now
+                skipped = int((now - self.next_frame) * self.fps)
+                self.play_index += skipped
+                self.play_position = self.play_index % len(self.project_frames)
+                self._show_frame_index(self.play_position)
                 self.play_index += 1
-                self.next_frame = now + 1.0 / self.fps
+                self.next_frame += (skipped + 1) / self.fps
+            return
+        if self.inspection_index is not None:
             return
         if self.demo:
             frame, hand = self.demo.read(now)

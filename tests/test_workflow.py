@@ -175,5 +175,100 @@ class StudioWorkflowTest(unittest.TestCase):
             self.assertIn("演示已拍好", studio.ui.status_label.cget("text"))
 
 
+    def test_inspecting_saved_frames_pauses_capture_until_live_preview_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            studio.start_demo()
+            start = studio.demo.started
+            for step in range(40):
+                studio._step(start + step * 0.1)
+            originals = [frame.tobytes() for frame in studio.store.frames]
+            self.assertEqual(len(originals), 2)
+
+            with patch.object(studio.ui, "show_frame", wraps=studio.ui.show_frame) as show_frame:
+                studio.seek_frame(0)
+                self.assertEqual(studio.inspection_index, 0)
+                self.assertEqual(show_frame.call_args.args[0].tobytes(), originals[0])
+                studio.ui.next_frame_button.invoke()
+                self.assertEqual(studio.inspection_index, 1)
+                self.assertEqual(show_frame.call_args.args[0].tobytes(), originals[1])
+                studio.step_frame(1)
+                self.assertEqual(studio.inspection_index, 1)
+                studio.ui.previous_frame_button.invoke()
+                studio.step_frame(-1)
+                self.assertEqual(studio.inspection_index, 0)
+
+                show_frame.reset_mock()
+                for step in range(40, 100):
+                    studio._step(start + step * 0.1)
+                show_frame.assert_not_called()
+                self.assertEqual([frame.tobytes() for frame in studio.store.frames], originals)
+
+            studio.ui.resume_button.invoke()
+            self.assertIsNone(studio.inspection_index)
+            for step in range(100, 147):
+                studio._step(start + step * 0.1)
+            after_resume = [frame.tobytes() for frame in studio.store.frames]
+            self.assertGreater(len(after_resume), len(originals))
+            self.assertEqual(after_resume[:len(originals)], originals)
+
+    def test_playback_starts_from_selected_frame_and_can_return_to_live(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            studio.start_demo()
+            start = studio.demo.started
+            for step in range(63):
+                studio._step(start + step * 0.1)
+            frames = studio.store.frames
+            self.assertEqual(len(frames), 3)
+            studio.seek_frame(1)
+
+            with patch.object(studio.ui, "show_frame", wraps=studio.ui.show_frame) as show_frame:
+                studio.ui.play_button.invoke()
+                studio._step(start + 6.5)
+                self.assertTrue(studio.playing)
+                self.assertEqual(show_frame.call_args.args[0].tobytes(), frames[1].tobytes())
+
+            studio.ui.play_button.invoke()
+            self.assertFalse(studio.playing)
+            self.assertIsNone(studio.inspection_index)
+            self.assertIsNotNone(studio.demo)
+            self.assertEqual([frame.tobytes() for frame in studio.store.frames],
+                             [frame.tobytes() for frame in frames])
+
+            studio.seek_frame(1)
+            studio.ui.play_button.invoke()
+            studio.ui.next_frame_button.invoke()
+            self.assertFalse(studio.playing)
+            self.assertEqual(studio.inspection_index, 2)
+
+
+    def test_mp4_export_uses_selected_path_and_frame_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = create_window()
+            root.withdraw()
+            studio = Studio(root, Path(directory) / "projects")
+            self.addCleanup(studio.close)
+            root.update_idletasks()
+            studio.store.append(Image.new("RGB", (80, 80), "green"))
+            studio._refresh()
+            studio.set_fps(6)
+            output = Path(directory) / "动画.mp4"
+
+            with (patch("app.filedialog.asksaveasfilename", return_value=str(output)) as dialog,
+                  patch.object(studio.store, "export_mp4") as export):
+                studio.ui.export_mp4_button.invoke()
+            self.assertEqual(dialog.call_args.kwargs["defaultextension"], ".mp4")
+            export.assert_called_once_with(output, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

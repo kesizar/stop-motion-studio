@@ -130,3 +130,68 @@ class SessionStoreTests(unittest.TestCase):
             with self.subTest(fps=fps), self.assertRaises(ValueError):
                 self.store.export_gif(path, fps)
         self.assertFalse(path.exists())
+
+
+    def test_mp4_decodes_with_odd_and_mixed_dimensions(self):
+        import cv2
+
+        red = Image.new("RGB", (65, 49), (255, 0, 0))
+        green = Image.new("RGB", (65, 21), (0, 255, 0))
+        blue = Image.new("RGB", (65, 49), (0, 0, 255))
+        for frame in (red, green, green, blue):
+            self.store.append(frame)
+
+        folder = self.root / "导出作品"
+        folder.mkdir()
+        path = folder / "动画.mp4"
+        with patch("tempfile.tempdir", str(folder)):
+            self.store.export_mp4(path, 12)
+        # Stage the decode under a simple filename so the test checks the
+        # application's Unicode output path independently of OpenCV's decoder.
+        copy = self.root / "decode.mp4"
+        copy.write_bytes(path.read_bytes())
+        video = cv2.VideoCapture(str(copy))
+        decoded = []
+        try:
+            self.assertAlmostEqual(video.get(cv2.CAP_PROP_FPS), 12)
+            while True:
+                ok, frame = video.read()
+                if not ok:
+                    break
+                decoded.append(frame)
+        finally:
+            video.release()
+        self.assertEqual(len(decoded), 4)
+        for frame, color_channel in zip(decoded, (2, 1, 1, 0)):
+            self.assertEqual(frame.shape, (50, 66, 3))
+            center = frame[24, 32]
+            self.assertGreater(center[color_channel], 220)
+            self.assertLess(sum(center) - center[color_channel], 25)
+        # The short frame has black letterbox bars, not a stretched image.
+        self.assertLess(int(decoded[1][2, 32].max()), 15)
+        self.assertLess(int(decoded[1][46, 32].max()), 15)
+        # The odd input's final row and column survive within the padded size.
+        self.assertGreater(decoded[0][24, 64, 2], 100)
+        self.assertGreater(decoded[0][48, 32, 2], 100)
+
+    def test_mp4_failures_leave_the_previous_file_intact(self):
+        path = self.root / "existing.mp4"
+        path.write_bytes(b"previous video")
+        with self.assertRaises(ValueError):
+            self.store.export_mp4(path, 12)
+        self.store.append(Image.new("RGB", (32, 32), "red"))
+        with self.assertRaises(ValueError):
+            self.store.export_mp4(path, 0)
+        with patch("cv2.VideoWriter") as factory:
+            writer = factory.return_value
+            writer.isOpened.return_value = False
+            with self.assertRaisesRegex(OSError, "编码器"):
+                self.store.export_mp4(path, 12)
+            writer.release.assert_called_once()
+            writer.reset_mock()
+            writer.isOpened.return_value = True
+            with self.assertRaisesRegex(OSError, "没有生成"):
+                self.store.export_mp4(path, 12)
+            writer.release.assert_called_once()
+        self.assertEqual(path.read_bytes(), b"previous video")
+        self.assertEqual(len(self.store.frames), 1)
